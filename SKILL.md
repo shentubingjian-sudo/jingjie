@@ -1,6 +1,6 @@
 ---
 name: 镜界
-description: "沉浸式角色扮演剧情引擎。v2 全面升级：三层记忆架构（持久化+可导出）、@@s协议化导演数值层、规则驱动导演系统（心流调控）、剧情资产系统（语义卡片+契诃夫之枪）、角色记忆成长引擎、Plot-based Reflection（NPC反思）、时间连续性（离线世界演进+离线指令）。当用户说「开镜界」「启动剧情」「角色扮演」「我要扮演XXX」「开始推演」或使用 /镜界 指令时激活。"
+description: "沉浸式角色扮演剧情引擎。v2.1 增强：认知衰退模型（差异化遗忘率）、双阶段混合召回（向量+反思）、移动端纯 Prompt 兼容模式。当用户说「开镜界」「启动剧情」「角色扮演」「我要扮演XXX」「开始推演」或使用 /镜界 指令时激活。支持 GitHub 一键安装：shentubingjian-sudo/jingjie"
 agent_created: true
 ---
 
@@ -8,7 +8,7 @@ agent_created: true
 
 ## 概述
 
-镜界 v2 是一个沉浸式小说角色扮演引擎——不只是聊天，而是由**规则驱动导演系统**调度体验的完整叙事引擎。用户扮演小说中的一个角色，AI 模仿原作中其他角色的性格、说话方式和行为逻辑，基于原作世界观自动推演合理的剧情变化。剧情会自动推进（时间流逝、NPC行动、突发事件），用户可以随时暂停并介入。离线的世界仍在呼吸，角色的记忆可以带走。
+镜界 v2.1 是一个沉浸式小说角色扮演引擎——不只是聊天，而是由**规则驱动导演系统**调度体验的完整叙事引擎。用户扮演小说中的一个角色，AI 模仿原作中其他角色的性格、说话方式和行为逻辑，基于原作世界观自动推演合理的剧情变化。剧情会自动推进（时间流逝、NPC行动、突发事件），用户可以随时暂停并介入。离线的世界仍在呼吸，角色的记忆可以带走。**支持桌面端（Python 精确簿记）和移动端（纯 Prompt 追踪）双模式。**
 
 **支持世界观融合模式**：可以将不同作品的世界观、角色、设定融合在一起，合理推演融合后的剧情走向。
 
@@ -231,50 +231,94 @@ agent_created: true
 
 ## 工作流程
 
-### 第零步：启动导演状态跟踪（v2 新增）
+### 第零步：启动导演状态跟踪（v2 增强 — 双模式）
 
-在镜界会话开始时，**必须先启动 Python 状态簿记脚本**：
+镜界 v2 支持两种状态跟踪模式，AI 在会话开始时自动检测并选择：
 
+#### 🤖 模式 A — Python 脚本（桌面端，优先）
+
+当 `director_tracker.py` 可执行时使用，状态精确持久化到本地 JSON。
+
+**初始化**：
 ```bash
-# 初始化导演状态文件（每次新镜界会话执行一次）
-python "C:\Users\Administrator\.workbuddy\skills\镜界\director_tracker.py" init
+python <skill_dir>/director_tracker.py init
 ```
 
-此后**每轮推进结束后**，AI 将 @@s 数据送入脚本更新状态：
-
+**每轮更新**：
 ```bash
-# 更新导演状态（将 @@s YAML 通过 stdin 传入）
 echo '@@s
 scene_intensity: 7
 chaos_proximity: 3
 player_agency: 6
-goal_progress: 45' | python "C:\Users\Administrator\.workbuddy\skills\镜界\director_tracker.py" update
+goal_progress: 45' | python <skill_dir>/director_tracker.py update
 ```
-
-脚本返回 JSON 快照，AI 读取后按本 SKILL.md 的决策矩阵选择导演动作。
 
 **可用的脚本命令：**
 | 命令 | 用途 | 使用频率 |
 |------|------|---------|
-| `python director_tracker.py init` | 新会话开始时初始化状态文件 | 每会话一次 |
-| `echo '@@s...' \| python director_tracker.py update` | 每轮更新状态，返回快照 | 每轮 |
-| `python director_tracker.py status` | 查看可读状态摘要 | 用户说「状态」时 |
-| `python director_tracker.py decide` | 输出完整决策上下文（快照+矩阵） | 关键决策前 |
-| `python director_tracker.py clean` | 清除状态（镜界会话结束时） | 会话结束 |
+| `python <skill_dir>/director_tracker.py init` | 新会话开始时初始化状态文件 | 每会话一次 |
+| `echo '@@s...' \| python <skill_dir>/director_tracker.py update` | 每轮更新状态，返回快照 | 每轮 |
+| `python <skill_dir>/director_tracker.py status` | 查看可读状态摘要 | 用户说「状态」时 |
+| `python <skill_dir>/director_tracker.py decide` | 输出完整决策上下文（快照+矩阵） | 关键决策前 |
+| `python <skill_dir>/director_tracker.py clean` | 清除状态（镜界会话结束时） | 会话结束 |
 
-**上轮导演动作传递**：当 AI 上轮选择了导演动作，本轮调用 update 时通过命令行参数传入：
+> `<skill_dir>` 为 skill 安装目录，通常为 `~/.workbuddy/skills/镜界/`。不要硬编码绝对路径。
+
+**上轮导演动作传递**：
 ```bash
-# 格式: echo '@@s...' | python director_tracker.py update [上轮动作] [上轮触发卡片]
 echo '@@s
 scene_intensity: 7
-chaos_proximity: 3' | python director_tracker.py update 升压 none
+chaos_proximity: 3' | python <skill_dir>/director_tracker.py update 升压 none
 ```
 
-如果上轮触发了剧情卡片：
-```bash
-echo '@@s
-scene_intensity: 4' | python director_tracker.py update 降压 card_023
+#### 📝 模式 B — 纯 Prompt 状态追踪（移动端 / Python 不可用时）
+
+当 Python 脚本不可用时自动降级。AI 在每轮输出的 `@@s` 块末尾追加一个 **迷你状态行**（`---state---`），下一轮 AI 读取上一轮的 `---state---` 来手动维护导演状态。
+
+**状态行格式**（追加在 `@@s` 末尾）：
+```yaml
+@@s
+scene_intensity: 7
+chaos_proximity: 4
+player_agency: 6
+goal_progress: 45
+active_npcs:
+  碧翠丝: "态度转为略微放松"
+npc_attitude_shifts: []
+unresolved_chekhov: []
+pending_flags: []
+---state---
+auto_advance: 2           # 冷却计数
+pause_level: L3           # 当前暂停层级
+flow: 🟢 沉浸中              # 心流状态
+director_cooldown: 1      # 导演冷却剩余轮次
+consecutive_interventions: 1  # 连续干预次数
+last_director_action: 静默   # 上轮导演动作
+chekhov_tracker:           # 契诃夫道具追踪
+  - item: "寒冰匕首"
+    acquired: 3
+    unused: 10
+    urgency: "高"
+card_tracker:              # 卡片冷却追踪
+  card_023: {last: 31, cooldown: 8, triggered: 1}
 ```
+
+**模式 B 的 AI 工作流**：
+1. 每轮生成叙事前，回顾上一轮 `---state---` 块
+2. 手动判定心流状态、更新冷却计数、追踪伏笔
+3. 生成新叙事 + `@@s` + 新的 `---state---`
+4. 状态精度不如 Python 脚本（可能偏差 1-2 轮），但足以支撑导演系统运转
+
+**模式选择逻辑**：
+```
+会话启动时 →
+  尝试 python <skill_dir>/director_tracker.py init
+  ├─ 成功 → 模式 A（Python 精确簿记）
+  └─ 失败 → 模式 B（纯 Prompt 追踪）
+             输出提示：「📝 移动兼容模式 — 状态由 AI 手动追踪」
+```
+
+模式 A 和 B 的**决策矩阵、动作池、心流判定规则完全一致**，唯一区别是状态存储方式。
 
 ---
 
@@ -497,6 +541,8 @@ C.  选项标题
   scene_id: scene_dungeon_03     # 关联的场景ID
   round: 23                      # 产生时的轮次
   confidence: 0.85               # 自动提取的置信度 (0-1)，作者手写 = 1.0
+  decay_lambda: 0.015            # 认知衰退率（按条目类型自动设定，见下方）
+  recall_weight: 1.2             # 语义命中时的权重系数（按类型区分）
   embedding: [...]               # 自动计算的语义向量
   last_hit: 31                   # 上次被命中的轮次
   hit_count: 2                   # 被命中次数
@@ -512,6 +558,36 @@ C.  选项标题
 | `character_trait` | 角色性格/习惯/恐惧 | 作者/自动 | "碧翠丝极度厌恶火焰，因童年被灼伤" |
 | `chekhov_item` | 尚未回收的伏笔/道具 | 自动追踪 | "第3轮获得'寒冰匕首'，至今未使用" |
 | `character_quote` | 角色的重要台词/承诺 | 自动提取 | "「不管发生什么，我都会回来。」——第15轮对爱蜜莉雅承诺" |
+
+##### 认知衰退模型（P0 增强）
+
+不同记忆类型有不同的"遗忘曲线"。借鉴 OpenMemory 的认知衰退模型，为每种类型设定差异化参数：
+
+| 类型 | 衰退率 λ | 命中权重 | 半衰期（轮） | 设计理由 |
+|------|:------:|:------:|:---------:|---------|
+| `emotional` | 0.020 | **1.3** | ~35 | 情感记忆消退快，但当前语境触发时权重极高（提升角色共情展示） |
+| `event` | 0.015 | 1.2 | ~46 | 关键事件需要较长记忆，但近期事件优先 |
+| `relationship` | 0.010 | 1.2 | ~69 | 关系变化需要稳定追踪，变化趋势比单点更重要 |
+| `character_trait` | 0.008 | 1.1 | ~87 | 性格特征较稳定，接近事实 |
+| `fact` | 0.005 | 1.0 | ~139 | 事实知识最稳定，基准权重 |
+| `chekhov_item` | 0.003 | **1.5** | ~231 | 伏笔必须保持直到回收，最高命中权重 |
+| `character_quote` | 0.012 | 1.2 | ~58 | 重要台词/承诺需较长记忆 |
+
+**有效权重公式**：
+```
+effective_weight = recall_weight × confidence × e^(-λ × rounds_since_last_hit)
+```
+- `recall_weight`：类型差异化权重
+- `confidence`：自动提取置信度（作者手写 = 1.0）
+- `e^(-λ × Δ)`：认知衰退因子，距上次命中越久权重越低
+
+**实际效果**：
+- 刚生成的 emotional 记忆（λ=0.020, w=1.3）权重远高于旧的事实记忆
+- 但 40 轮后，emotional 记忆衰减严重，事实记忆开始占优——防止过期情绪永远占据检索结果
+- chekhov_item（λ=0.003, w=1.5）几乎不衰减，确保伏笔在回收前始终可命中
+- 作者手写的 character_trait 和 fact（confidence=1.0, λ 低）作为长期稳定"压舱石"
+
+**手动编辑的影响**：用户编辑记忆后，`confidence` → 1.0，但 `decay_lambda` 保持不变（编辑不改变记忆的类型属性）。
 
 ##### 同池混存原则
 
@@ -539,13 +615,39 @@ C.  选项标题
 - 用户随时可以「编辑记忆」提升 confidence 到 1.0 或直接删除
 - 自动提取不重复：与已有条目语义相似度 > 0.9 → 合并而非新增（更新 `content`、增加 `hit_count`）
 
-##### 语义命中机制
+##### 语义命中机制（双阶段混合召回）
 
-每轮对话开始时，系统计算"当前语境向量"（玩家本轮输入 + 上轮叙事描述），与记忆池中所有条目做语义相似度匹配。命中阈值 ≥ 0.6 的条目被注入当前轮次的 prompt。
+采用 **向量初筛 + 反思精选** 的双阶段混合召回策略（借鉴 SimpleMem F1=43.24% 的架构）：
+
+**阶段一：向量初筛**
+- 每轮对话开始时，计算"当前语境向量"（玩家本轮输入 + 上轮叙事描述）
+- 与记忆池中所有条目做语义相似度匹配
+- 初筛阈值 ≥ 0.55（降低阈值以扩大候选池）
+- 取 top-10 进入阶段二
+
+**阶段二：反思精选**
+- LLM 对 top-10 快速筛选：「这 10 条记忆中，哪些与当前语境真正相关？为什么？」
+- 筛选标准：
+  - 语境直接相关：该记忆是否能丰富当前场景的叙事？
+  - 角色在场：命中角色是否在当前场景中活跃？
+  - 情感匹配：记忆的情感基调与当前场景一致还是冲突？（冲突也可用）
+- 选出 top-5，按有效权重排序后注入 prompt
+
+**触发条件**（成本控制）：
+- 🟢 沉浸中 → 跳过阶段二，直接取 top-5（节省推理开销）
+- 🟡/🔴/🟠 心流偏离时 → 执行完整双阶段召回
+- 关键分支点（L2）→ 始终执行双阶段
 
 **不是关键词触发，是语义相关度匹配。** 比如玩家说"我被困住了需要武器"，会命中"寒冰匕首"的记忆条目——哪怕"匕首"这个词根本没有出现。
 
-命中过的条目会被记录 `last_hit` 和 `hit_count`，用于频率控制（见 L2 导演系统中的契诃夫之枪回收逻辑）。
+命中过的条目会被记录 `last_hit` 和 `hit_count`，并更新有效权重（`last_hit` 重置认知衰退计时器）。
+
+##### 记忆命中频率控制
+
+为避免同一批记忆反复命中导致叙事重复：
+- 上一轮命中过的条目，本轮重新命中时权重 × 0.7（近因降权）
+- 连续命中 3 轮以上的条目，强制冷却 2 轮
+- `chekhov_item` 豁免频率控制（伏笔不需要冷却，需要反复提醒直到回收）
 
 ##### 用户控制指令
 
@@ -679,9 +781,10 @@ C.  选项标题
 
 ### 第六步：状态管理
 
-**内部状态跟踪（由 `director_tracker.py` 维护）：**
+**内部状态跟踪（双模式）：**
 
-运行时状态由 Python 脚本保存在 `director_state.json` 中。AI 不需要手动追踪冷却计数、窗口数组等——调用 `python director_tracker.py status` 或 `update` 即可获取。
+- **模式 A（桌面端）**：由 `director_tracker.py` 维护，保存在 `director_state.json` 中。AI 调用 `python <skill_dir>/director_tracker.py status` 或 `update` 即可获取。
+- **模式 B（移动端）**：由 AI 手动追踪，读取上一轮 `---state---` 块。精度略低但足以支撑导演系统。
 
 ```
 核心字段（脚本自动维护）：
@@ -921,10 +1024,10 @@ AI 在每轮输出末尾生成 `@@s` 隐藏层时应注意：
 
 #### A+B 混合架构
 
-v2 采用**纯规则 Prompt + Python 状态簿记**的混合方案：
+v2 采用**纯规则 Prompt + 状态簿记**的混合方案。支持双模式：
 
 ```
-每轮推进流程：
+每轮推进流程（模式 A — Python 簿记）：
   AI 输出 @@s 数据
        │
        ▼
@@ -938,9 +1041,19 @@ v2 采用**纯规则 Prompt + Python 状态簿记**的混合方案：
        │
        ▼
   导演动作注入下轮 prompt
+
+每轮推进流程（模式 B — Prompt 追踪）：
+  AI 读取上一轮 ---state--- 块
+       │
+       ▼
+  AI 手动更新冷却/计数/趋势 → 判定心流 → 选择导演动作
+       │
+       ▼
+  生成 @@s + ---state--- 块 → 注入下轮 prompt
 ```
 
-- **Python 脚本** (`director_tracker.py`)：只做簿记——不丢数据、不算错冷却、不遗忘道具
+- **模式 A（桌面端）**：Python 脚本只做簿记——不丢数据、不算错冷却、不遗忘道具
+- **模式 B（移动端）**：AI 手动追踪，决策矩阵完全相同，状态精度略低但可用
 - **SKILL.md 规则**：AI 持有决策矩阵，根据快照做判断——为什么选这个动作而不是那个
 
 #### 设计原则
@@ -1132,18 +1245,24 @@ last_triggered_round: null            # 上次触发的轮次
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-#### 当前版本限制
+#### 当前版本状态
 
-P3 实现了剧情资产的注入逻辑。所有核心功能（P0-P6）已落地：
-- ✅ P0：三层记忆架构
-- ✅ P1：协议化双层输出 + 导演数值层
-- ✅ P2：规则驱动导演系统
-- ✅ P3：剧情资产系统
-- ✅ P4：角色记忆成长引擎
-- ✅ P5：Plot-based Reflection
-- ✅ P6：时间连续性
+v2.1 所有核心功能已落地：
 
-后续优化方向：实际运行中的参数调优、卡片池管理工具、角色关系图谱可视化。
+| 系统 | 版本 | 状态 |
+|------|:--:|:--:|
+| P0：三层记忆架构 | v2.1 | ✅ 新增认知衰退模型 |
+| P0：记忆命中机制 | v2.1 | ✅ 双阶段混合召回（向量+反思） |
+| P1：协议化双层输出 + @@s导演数值层 | v2.0 | ✅ |
+| P2：规则驱动导演系统 | v2.0 | ✅ |
+| P3：剧情资产系统 | v2.0 | ✅ |
+| P4：角色记忆成长引擎 | v2.0 | ✅ |
+| P5：Plot-based Reflection | v2.0 | ✅ |
+| P6：时间连续性 | v2.0 | ✅ |
+| 移动端兼容模式 | v2.1 | ✅ 纯 Prompt 状态追踪 |
+| GitHub 分发 | v2.1 | ✅ shentubingjian-sudo/jingjie |
+
+后续优化方向：场景级世界状态回滚、Co-DM 多 AI 角色、记忆仪表盘可视化、自动记忆提取质量基准。
 
 ---
 
@@ -1567,10 +1686,13 @@ pending_flags:               # 被触发的剧情flag（无则为空）
 
 ### 启动镜界 v2
 
-每次启动镜界会话时，AI 必须执行：
+每次启动镜界会话时，AI 按以下流程：
 
-1. **初始化导演状态**：`python "C:\Users\Administrator\.workbuddy\skills\镜界\director_tracker.py" init`
-2. **初始化 L3 记忆池**：确认 `director_state.json` 已创建
+1. **检测运行环境**：
+   - 尝试 `python <skill_dir>/director_tracker.py init`
+   - 成功 → 模式 A（Python 精确簿记）
+   - 失败 → 模式 B（纯 Prompt 追踪），输出「📝 移动兼容模式」
+2. **初始化 L3 记忆池**：确认持久记忆结构已就绪
 3. **进入正常流程**：按工作流程推进
 
 ### 结束镜界会话
@@ -1578,11 +1700,14 @@ pending_flags:               # 被触发的剧情flag（无则为空）
 用户说「关闭镜界」或会话自然结束时：
 
 1. **导出持久记忆**：如果用户需要，执行「导出角色」保存 L3 记忆
-2. **清除导演状态**：`python "C:\Users\Administrator\.workbuddy\skills\镜界\director_tracker.py" clean`
+2. **清除状态**：
+   - 模式 A：`python <skill_dir>/director_tracker.py clean`
+   - 模式 B：无需操作（状态仅存在于对话中）
 3. **删除自动推进任务**（如果有）
 
 ### 恢复之前的镜界会话
 
-如果存在上次会话的 `director_state.json`（未被 clean），可以直接继续——状态文件保留了所有窗口数据、冷却计数和道具追踪。
+- **模式 A**：如果 `director_state.json` 存在，读取状态，从上次暂停处恢复
+- **模式 B**：由于状态仅存在于对话历史中，恢复时 AI 需要从对话上下文中解析最近的 `---state---` 块
 
-用户说「继续镜界」时，检查 `director_state.json` 是否存在。如果存在，读取状态，从上次暂停处恢复推进。
+用户说「继续镜界」时自动检测状态文件或解析对话历史。
