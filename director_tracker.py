@@ -37,12 +37,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-try:  # Unix/macOS 文件锁；Windows 下自动退化为原子替换 + revision 检查
+try:  # Unix/macOS 文件锁
     import fcntl  # type: ignore
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
+try:  # P0-2.5: Windows 文件锁
+    import msvcrt  # type: ignore
+except ImportError:  # pragma: no cover - Unix/macOS
+    msvcrt = None
 
+
+RUNTIME_VERSION = "2.7.1"
 SCHEMA_VERSION = "2.6"
 WINDOW_SIZE = 8
 GENERAL_COOLDOWN = 2
@@ -58,8 +64,18 @@ CHAIN_QUEUE_TTL = 2
 
 VALID_ACTIONS = {"升压", "降压", "给突破口", "加阻力", "推动回收", "日常过渡"}
 VALID_PAUSE_LEVELS = {"L1", "L2", "L3", "L4"}
+VALID_PAUSE_STATUSES = {"RUNNING", "PAUSED"}
+# P1-3.1: 合法的暂停层级+状态组合（L1/L2/L4 必须 PAUSED，L3 必须 RUNNING）
+VALID_PAUSE_COMBINATIONS = {
+    ("L1", "PAUSED"),
+    ("L2", "PAUSED"),
+    ("L3", "RUNNING"),
+    ("L4", "PAUSED"),
+}
 VALID_CARD_POSITIONS = {"core_rule", "world_context", "recent_focus"}
 VALID_DELAY_MODES = {"continuous", "latched"}
+VALID_CARD_SOURCES = {"author", "auto_generated", "imported"}
+VALID_CARD_TYPES = {"chekhov_gun", "encounter", "revelation", "crisis", "character_moment", "world_event"}
 
 ACTION_WEIGHTS: dict[str, list[tuple[Optional[str], float]]] = {
     "沉浸中": [(None, 1.0)],
@@ -163,7 +179,8 @@ def migrate_state(raw: dict[str, Any]) -> dict[str, Any]:
                 spec = {"id": card_id}
                 if isinstance(runtime, dict):
                     spec.update(runtime)
-                state["cards"][card_id] = normalize_card_spec(spec)
+                # 迁移模式：宽松校验，非法枚举用默认值
+                state["cards"][card_id] = normalize_card_spec(spec, strict=False)
 
         for key in ("pause", "timeline"):
             if isinstance(raw.get(key), dict):
@@ -189,16 +206,30 @@ def migrate_state(raw: dict[str, Any]) -> dict[str, Any]:
 
 @contextlib.contextmanager
 def state_lock(state_file: Path) -> Iterator[None]:
+    """P0-2.5: 跨平台文件锁 — Unix 用 fcntl.flock，Windows 用 msvcrt.locking"""
     state_file.parent.mkdir(parents=True, exist_ok=True)
     lock_path = state_file.with_suffix(state_file.suffix + ".lock")
-    with open(lock_path, "a+", encoding="utf-8") as lock_fp:
+    with open(lock_path, "a+b") as lock_fp:
         if fcntl is not None:
             fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        elif msvcrt is not None:
+            # Windows: 写入一个字节并锁定它
+            lock_fp.seek(0)
+            lock_fp.write(b"\0")
+            lock_fp.flush()
+            lock_fp.seek(0)
+            msvcrt.locking(lock_fp.fileno(), msvcrt.LK_LOCK, 1)
         try:
             yield
         finally:
             if fcntl is not None:
                 fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                lock_fp.seek(0)
+                try:
+                    msvcrt.locking(lock_fp.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass  # 锁可能已释放
 
 
 def load_state(state_file: Path, required: bool = False) -> Optional[dict[str, Any]]:
@@ -571,23 +602,33 @@ def resolve_chekhov(state: dict[str, Any], name: str) -> None:
         item["resolved_round"] = state["total_rounds"]
 
 
-def normalize_card_spec(spec: dict[str, Any]) -> dict[str, Any]:
+def _require_enum(field: str, value: Any, allowed: set[str], default: str, strict: bool = True) -> str:
+    """P1-3.4: 枚举校验 — strict=True 时非法值报错，strict=False 时用默认值（用于迁移）"""
+    if value is None:
+        return default
+    if value not in allowed:
+        if strict:
+            raise ValueError(f"{field} 非法：{value!r}；允许值：{sorted(allowed)}")
+        return default
+    return str(value)
+
+
+def normalize_card_spec(spec: dict[str, Any], strict: bool = True) -> dict[str, Any]:
+    """卡片规范化。strict=True（新注册）时非法枚举报错；strict=False（迁移）时用默认值"""
     card_id = str(spec.get("id") or spec.get("card_id") or "").strip()
     if not card_id:
         raise ValueError("剧情卡缺少 id")
-    priority = spec.get("priority", "中")
-    if priority not in {"高", "中", "低"}:
-        priority = "中"
-    position = spec.get("inject_position", "recent_focus")
-    if position not in VALID_CARD_POSITIONS:
-        position = "recent_focus"
-    delay_mode = spec.get("delay_mode", "latched")
-    if delay_mode not in VALID_DELAY_MODES:
-        delay_mode = "latched"
+    priority = _require_enum("priority", spec.get("priority"), {"高", "中", "低"}, "中", strict)
+    position = _require_enum("inject_position", spec.get("inject_position"), VALID_CARD_POSITIONS, "recent_focus", strict)
+    delay_mode = _require_enum("delay_mode", spec.get("delay_mode"), VALID_DELAY_MODES, "latched", strict)
+    card_type = _require_enum("type", spec.get("type"), VALID_CARD_TYPES, "world_event", strict)
+    # P1-3.2: 保留 source 字段
+    source = _require_enum("source", spec.get("source"), VALID_CARD_SOURCES, "author", strict)
 
     return {
         "id": card_id,
-        "type": spec.get("type", "world_event"),
+        "type": card_type,
+        "source": source,  # P1-3.2: 保留来源标记
         "trigger_hint": spec.get("trigger_hint", ""),
         "director_action": spec.get("director_action", "任意"),
         "priority": priority,
@@ -642,16 +683,35 @@ def register_cards(state: dict[str, Any], specs: Iterable[dict[str, Any]]) -> li
     return registered
 
 
+def _require_json_bool(value: Any, field_name: str) -> bool:
+    """P1-3.5: 严格校验 JSON boolean，拒绝字符串 "false"/"true" 等"""
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"{field_name} 必须为 JSON boolean (true/false)，收到：{value!r} ({type(value).__name__})"
+        )
+    return value
+
+
 def update_card_condition(state: dict[str, Any], card_id: str, met: bool) -> None:
     card = state["cards"].get(card_id)
     if not card:
         raise KeyError(f"剧情卡未注册：{card_id}")
-    card["conditions_met"] = bool(met)
+
     if met:
+        # 条件满足：记录首次满足轮次，标记条件已满足
+        card["conditions_met"] = True
         if card.get("condition_first_met_round") is None:
             card["condition_first_met_round"] = state["total_rounds"]
-    elif card.get("delay_mode") == "continuous":
+        return
+
+    # 条件不满足
+    if card.get("delay_mode") == "continuous":
+        # P0-2.1: continuous 模式 — 条件失效后清零
+        card["conditions_met"] = False
         card["condition_first_met_round"] = None
+    else:
+        # P0-2.1: latched 模式 — 一旦曾经满足，继续保持锁定
+        card["conditions_met"] = card.get("condition_first_met_round") is not None
 
 
 def card_chain_boost(state: dict[str, Any], card_id: str) -> tuple[float, int]:
@@ -717,6 +777,8 @@ def select_card(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any
     director_action = payload.get("director_action")
     candidates = payload.get("candidates", [])
     allow_semantic_breakthrough = bool(payload.get("allow_semantic_breakthrough", True))
+    # P0-2.3: 支持从 payload 临时传入卡片条件（只读选卡，不写状态）
+    temp_conditions = payload.get("conditions", {})
     scored: list[dict[str, Any]] = []
     excluded: list[dict[str, str]] = []
 
@@ -728,6 +790,21 @@ def select_card(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any
         if not card:
             excluded.append({"card_id": card_id, "reason": "未注册"})
             continue
+
+        # P0-2.3: 如果 payload 带了临时条件，先用它更新内存中的卡片状态（不落盘）
+        if card_id in temp_conditions:
+            temp_met = _require_json_bool(temp_conditions[card_id], f"conditions.{card_id}")
+            # 临时更新条件，模拟 update_card_condition 的效果
+            if temp_met:
+                card["conditions_met"] = True
+                if card.get("condition_first_met_round") is None:
+                    card["condition_first_met_round"] = state["total_rounds"]
+            elif card.get("delay_mode") == "continuous":
+                card["conditions_met"] = False
+                card["condition_first_met_round"] = None
+            else:
+                card["conditions_met"] = card.get("condition_first_met_round") is not None
+
         can, reason = can_trigger_card(state, card_id)
         if not can:
             excluded.append({"card_id": card_id, "reason": reason})
@@ -813,15 +890,28 @@ def update_pause(state: dict[str, Any], patch: dict[str, Any]) -> None:
     if not isinstance(pause_patch, dict):
         return
     level = pause_patch.get("level")
+    status = pause_patch.get("status")
+
+    # P1-3.1: 先确定新值，再校验组合
+    new_level = level if level is not None else state["pause"]["level"]
+    new_status = status if status is not None else state["pause"]["status"]
+
     if level is not None:
         if level not in VALID_PAUSE_LEVELS:
             raise ValueError(f"未知暂停层级：{level}")
         state["pause"]["level"] = level
-    status = pause_patch.get("status")
     if status is not None:
-        if status not in {"RUNNING", "PAUSED"}:
+        if status not in VALID_PAUSE_STATUSES:
             raise ValueError(f"未知暂停状态：{status}")
         state["pause"]["status"] = status
+
+    # P1-3.1: 校验层级+状态组合合法性
+    if (new_level, new_status) not in VALID_PAUSE_COMBINATIONS:
+        raise ValueError(
+            f"非法暂停组合：{new_level}/{new_status}；"
+            f"合法组合：L1/L2/L4 必须 PAUSED，L3 必须 RUNNING"
+        )
+
     for key in ("auto_advance_count", "cooldown_threshold"):
         if key in pause_patch:
             state["pause"][key] = max(0, int(pause_patch[key]))
@@ -916,19 +1006,47 @@ def remember_idempotency(state: dict[str, Any], key: Optional[str]) -> None:
     state["idempotency_keys"] = state["idempotency_keys"][-IDEMPOTENCY_LIMIT:]
 
 
+def _is_resume_patch(patch: dict[str, Any]) -> bool:
+    """判断补丁是否是恢复操作（从 L1/L2/L4 恢复到 L3/RUNNING）"""
+    pause_patch = patch.get("pause")
+    if not isinstance(pause_patch, dict):
+        return False
+    return (
+        pause_patch.get("level") == "L3"
+        and pause_patch.get("status") == "RUNNING"
+    )
+
+
+def assert_round_can_advance(state: dict[str, Any], patch: dict[str, Any]) -> None:
+    """P0-2.2: 暂停门禁 — L1/L2/L4 暂停时禁止推进剧情，除非是恢复操作"""
+    pause = state.get("pause", {})
+    level = pause.get("level", "L3")
+    status = pause.get("status", "RUNNING")
+    blocked = status == "PAUSED" or level in {"L1", "L2", "L4"}
+    if blocked and not _is_resume_patch(patch):
+        raise RuntimeError(
+            f"当前处于 {level}/{status} 暂停状态，禁止推进剧情轮次。"
+            f"如需恢复，请在补丁中包含 pause.level=L3, pause.status=RUNNING"
+        )
+
+
 def apply_update(
     state: dict[str, Any],
     patch: dict[str, Any],
     last_action: Optional[str] = None,
     triggered_card: Optional[str] = None,
 ) -> dict[str, Any]:
+    # P0-2.2: 暂停门禁 — 在任何状态变更之前检查
+    assert_round_can_advance(state, patch)
+
     tick_cooldowns(state)
     tick_chekhov_items(state)
     prune_card_runtime(state)
-    apply_director_action(state, last_action)
 
-    # 先推进到新轮次，再记录本轮产生的数据；所有 round 字段语义一致
+    # P0-2.4: 先推进到新轮次，再记录本轮产生的数据；所有 round 字段语义一致
     state["total_rounds"] += 1
+
+    apply_director_action(state, last_action)
     prune_card_runtime(state)
 
     metrics = normalize_metrics(patch)
@@ -954,7 +1072,9 @@ def apply_update(
     conditions = patch.get("card_conditions", {})
     if isinstance(conditions, dict):
         for card_id, met in conditions.items():
-            update_card_condition(state, card_id, bool(met))
+            # P1-3.5: 严格校验 JSON boolean
+            normalized_met = _require_json_bool(met, f"card_conditions.{card_id}")
+            update_card_condition(state, str(card_id), normalized_met)
 
     if triggered_card:
         trigger_card(state, triggered_card, int(patch.get("chain_depth", 0)))
@@ -1153,8 +1273,10 @@ def cmd_card_conditions(args: argparse.Namespace) -> None:
         validate_revision(state, args.expected_revision)
         updated: dict[str, bool] = {}
         for card_id, met in payload.items():
-            update_card_condition(state, str(card_id), bool(met))
-            updated[str(card_id)] = bool(met)
+            # P1-3.5: 严格校验 JSON boolean
+            normalized = _require_json_bool(met, f"card_conditions.{card_id}")
+            update_card_condition(state, str(card_id), normalized)
+            updated[str(card_id)] = normalized
         commit_state(args.state_file, state, "card_conditions", {"conditions": updated})
     output_json({"ok": True, "updated": updated, "revision": state["revision"]})
 

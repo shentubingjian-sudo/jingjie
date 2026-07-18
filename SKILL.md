@@ -1,12 +1,12 @@
 ---
 name: 镜界
-description: "沉浸式角色扮演剧情引擎 v2.7。合并 v2.6 工程升级（原子写入/文件锁/revision/幂等性/分支回滚/会话隔离/JSON状态补丁）与 v2.5 完整功能（认知衰退/混合召回/画像预加载/反思机制/记忆质量/仪表盘/双时间线/导演便签/剧情卡定时效果）。桌面端 Python 标准库运行时。GitHub: shentubingjian-sudo/jingjie"
+description: "沉浸式角色扮演剧情引擎 v2.7.1。合并 v2.6 工程升级 + v2.5 完整功能 + GPT 审查的 P0/P1 修复。桌面端 Python 标准库运行时。GitHub: shentubingjian-sudo/jingjie"
 agent_created: true
 ---
 
-# 镜界 · 沉浸式角色扮演剧情引擎 v2.7
+# 镜界 · 沉浸式角色扮演剧情引擎 v2.7.1
 
-> **v2.7 = v2.6 工程升级 + v2.5 完整功能**。取 v2.6 的生产级 Python 运行时（原子写入/文件锁/revision/幂等性/分支系统）和精简 SKILL 骨架（规则优先级/响应模式/失败降级/验收测试），从 v2.5 补回被过度压缩的核心功能（P5 NPC 反思 / P8 记忆质量 / P10 画像预加载 / P11 仪表盘 / P4 成长追踪 / 融合启动流程 / 认知衰退设计理由）。
+> **v2.7.1**：在 v2.7（v2.6 工程 + v2.5 功能合并）基础上，修复 GPT 审查发现的全部 P0/P1 问题：暂停门禁、轮次偏移、latched delay 锁定、Windows 文件锁、revision 单次提交工作流、暂停组合校验、JSON bool 严格校验、卡片 source 字段保留、枚举严格校验、反思加权改为软规则。
 
 ## 1. 定位与边界
 
@@ -145,20 +145,17 @@ python <skill_dir>/director_tracker.py decide
 
 该命令是只读的。同一状态、同一 seed 和同一 revision 会得到相同结果。
 
-### 6.5 更新剧情卡条件并选卡
+### 6.5 评估剧情卡条件并选卡
 
-宿主根据当前事实判断每张候选卡的硬条件，将结果批量提交：
-
-```bash
-printf '%s' '{"card_023":true,"card_024":false}' \
-  | python <skill_dir>/director_tracker.py card-conditions
-```
-
-向量层计算当前语境与候选卡 `trigger_hint` 的语义相似度，再调用：
+**推荐流程（每轮单次写入）**：宿主在内部临时评估每张候选卡的硬条件（`required_conditions` / `required_absent`），然后调用只读的 `card-select`：
 
 ```bash
 printf '%s' '{
   "director_action":"升压",
+  "conditions":{
+    "card_023": true,
+    "card_024": false
+  },
   "candidates":[
     {"card_id":"card_023","semantic":0.86},
     {"card_id":"card_024","semantic":0.71}
@@ -166,7 +163,11 @@ printf '%s' '{
 }' | python <skill_dir>/director_tracker.py card-select
 ```
 
-如果导演静默，只有原始语义分数 `> 0.85` 的卡允许“语义突破”。
+`card-select` 是只读的，不修改状态、不递增 revision。选中的卡片 ID 在第 6.10 步随 `update` 一起提交。
+
+**备用流程（手动调试）**：`card-conditions` 命令会写入状态并递增 revision，仅用于手动调试或独立更新卡片条件。正常剧情轮不要使用此命令，避免 revision 追踪混乱。
+
+如果导演静默，只有原始语义分数 `> 0.85` 的卡允许"语义突破"。
 
 ### 6.6 召回记忆
 
@@ -672,7 +673,7 @@ growth:
 - 反思结果必须与 NPC 的**性格一致**（碧翠丝的反思是嘴硬心软，不会突然变得直白）
 - 反思可以**修正之前的误判**（"我之前以为他只是鲁莽..."）
 
-**与导演系统的联动**：当多个 NPC 的反思都指向"玩家值得信任"时，导演的"日常过渡"动作触发权重 +20%——给关系深化留空间。
+**与导演系统的联动**：NPC 反思结果作为导演便签的输入信息，可影响模型对"日常过渡"方向的判断，给关系深化留空间。反思是叙事层面的软影响，不对应固定的程序性权重数值。
 
 ## 12. 知识隔离与时间线
 
@@ -1256,6 +1257,16 @@ L3 记忆池统计：
 22. 摘要回滚只回滚 L2，不影响世界状态（补回自 v2.5）。
 23. 认知衰退用 `last_confirmed_round` 而非 `last_hit`（v2.6 改进）。
 24. 融合模式可正确启动并建立力量对标表（补回自 v2.5）。
+25. L1/L2/L4 暂停时调用 `update` 必须报错（P0-2.2 修复）。
+26. 恢复补丁（pause.level=L3, status=RUNNING）可通过 `update` 恢复推进（P0-2.2 修复）。
+27. 第 1 轮导演动作的 `last_action_round` 记录为 1 而非 0（P0-2.4 修复）。
+28. latched delay 卡片条件首次满足后变 False，仍可触发（P0-2.1 修复）。
+29. `card_conditions` 中传入字符串 `"false"` 必须报错（P1-3.5 修复）。
+30. L1/RUNNING 等非法暂停组合必须报错（P1-3.1 修复）。
+31. 非法枚举值（priority/inject_position/delay_mode/type/source）在新注册时报错（P1-3.4 修复）。
+32. `card-select` 支持从 payload 临时传入 `conditions`，不写状态、不递增 revision（P0-2.3 修复）。
+33. 卡片 `source` 字段在注册时被保留（P1-3.2 修复）。
+34. Windows 环境下 `state_lock` 使用 msvcrt.locking 提供真正的并发锁（P0-2.5 修复）。
 
 ## 26. 会话结束
 
