@@ -1,709 +1,1376 @@
 #!/usr/bin/env python3
 """
-镜界 v2 导演状态簿记脚本
-===========================
-职责：纯数据维护，不做任何决策。
-- 解析每轮 @@s 隐藏层数据
-- 维护 8 轮滑动窗口
-- 追踪所有冷却计数器（不丢数）
-- 追踪契诃夫道具的未使用轮次
-- 追踪剧情卡片触发历史
-- 计算窗口趋势和心流状态
-- 输出状态快照 → AI 拿着快照按 SKILL.md 规则做决策
+镜界 v2.6 导演状态与剧情卡运行时
+=================================
 
-原则：程序管数，AI 管判断。
+职责：
+- 维护导演数值、滑动窗口、冷却、暂停状态和契诃夫道具
+- 以可复现随机方式选择导演动作
+- 维护剧情卡 cooldown / max_triggers / sticky / delay / chain
+- 提供原子写入、revision 并发检查、idempotency 去重
+- 创建、预览和回滚完整状态快照
+
+边界：
+- 本脚本不生成叙事文本
+- 本脚本不做向量嵌入；语义分数由宿主传入
+- 本脚本不保存模型隐藏思维，只接收明确的结构化状态补丁
+- 优先接收 JSON；兼容旧版 @@s 简单 YAML
+
+仅使用 Python 标准库。
 """
 
+from __future__ import annotations
+
+import argparse
+import ast
+import contextlib
+import copy
+import hashlib
 import json
 import os
-import sys
+import random
 import re
-from datetime import datetime
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterable, Iterator, Optional
 
-# ── 配置 ──────────────────────────────────────────────
+try:  # Unix/macOS 文件锁；Windows 下自动退化为原子替换 + revision 检查
+    import fcntl  # type: ignore
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
 
-STATE_FILE = Path(__file__).parent / "director_state.json"
+
+SCHEMA_VERSION = "2.6"
 WINDOW_SIZE = 8
-L3_COOLDOWN_GENERAL = 2       # 导演通用冷却轮数
-L3_CONSECUTIVE_MAX = 3        # 最多连续干预次数
-L3_CONSECUTIVE_SILENCE = 3    # 连干预超限后强制静默轮数
-L3_DAILY_COOLDOWN = 5         # "日常过渡"冷却
-L3_RECYCLE_COOLDOWN = 3       # "推动回收"冷却
+GENERAL_COOLDOWN = 2
+CONSECUTIVE_MAX = 3
+CONSECUTIVE_SILENCE = 3
+DAILY_COOLDOWN = 5
+RECYCLE_COOLDOWN = 3
+CHECKPOINT_LIMIT_PER_KIND = 10
+EVENT_LOG_LIMIT = 200
+IDEMPOTENCY_LIMIT = 100
+CHAIN_DEPTH_LIMIT = 2
+CHAIN_QUEUE_TTL = 2
 
-# ── 状态初始化 ──────────────────────────────────────────
+VALID_ACTIONS = {"升压", "降压", "给突破口", "加阻力", "推动回收", "日常过渡"}
+VALID_PAUSE_LEVELS = {"L1", "L2", "L3", "L4"}
+VALID_CARD_POSITIONS = {"core_rule", "world_context", "recent_focus"}
+VALID_DELAY_MODES = {"continuous", "latched"}
 
-def init_state(session_id: str = None) -> dict:
-    """创建全新的导演状态文件"""
+ACTION_WEIGHTS: dict[str, list[tuple[Optional[str], float]]] = {
+    "沉浸中": [(None, 1.0)],
+    "趋近无聊": [("升压", 0.70), ("加阻力", 0.30)],
+    "趋近焦虑": [("降压", 0.60), ("给突破口", 0.40)],
+    "失去方向": [("给突破口", 0.50), ("推动回收", 0.50)],
+    "高能后回落": [("日常过渡", 0.90), (None, 0.10)],
+}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def default_state_file() -> Path:
+    env_path = os.environ.get("JINGJIE_STATE_FILE")
+    if env_path:
+        return Path(env_path).expanduser().resolve()
+    return Path(__file__).with_name("director_state.json")
+
+
+def _new_branch_id(prefix: str = "branch") -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+def init_state(session_id: Optional[str] = None, seed: Optional[str] = None) -> dict[str, Any]:
+    session_id = session_id or uuid.uuid4().hex[:12]
+    seed = seed or uuid.uuid4().hex
     return {
-        "session_id": session_id or datetime.now().strftime("%Y%m%d_%H%M%S"),
-        "started_at": datetime.now().isoformat(),
+        "schema_version": SCHEMA_VERSION,
+        "revision": 0,
+        "session_id": session_id,
+        "seed": seed,
+        "started_at": now_iso(),
+        "updated_at": now_iso(),
         "total_rounds": 0,
-        "state_version": "v2.0",
-        "ats_window": [],                    # 最近 WINDOW_SIZE 轮的 @@s 数据
-        "flow_state": "沉浸中",              # 当前心流状态
-        "flow_rounds_in_state": 0,           # 在当前心流状态持续了多少轮
-        "director": {
-            "last_action": None,             # 上次导演动作（动作名/None）
-            "last_action_round": None,       # 上次动作所在轮次
-            "action_cooldown_remaining": 0,  # 通用冷却剩余轮数
-            "consecutive_interventions": 0,  # 连续干预次数
-            "consecutive_silence_required": 0, # 强制静默剩余轮数
-            "daily_transition_cooldown": 0,  # "日常过渡"冷却剩余
-            "push_recycle_cooldown": 0,      # "推动回收"冷却剩余
-            "intervention_history": []       # 最近几轮的动作记录（用于防抽搐）
+        "ats_window": [],
+        "flow_state": "沉浸中",
+        "flow_rounds_in_state": 0,
+        "pause": {
+            "level": "L3",
+            "status": "RUNNING",
+            "auto_advance_count": 0,
+            "cooldown_threshold": 3,
         },
-        "chekhov_items": [],                 # 契诃夫道具追踪
-        "cards": {},                         # 剧情卡片追踪
-        "npc_attitude_log": []               # NPC 态度变化日志
+        "director": {
+            "last_action": None,
+            "last_action_round": None,
+            "action_cooldown_remaining": 0,
+            "consecutive_interventions": 0,
+            "rounds_since_intervention": 0,
+            "consecutive_silence_required": 0,
+            "daily_transition_cooldown": 0,
+            "push_recycle_cooldown": 0,
+            "intervention_history": [],
+        },
+        "chekhov_items": {},
+        "cards": {},
+        "chain_queue": [],
+        "npc_attitude_log": [],
+        "timeline": {
+            "current_branch_id": "branch_main",
+            "parent_branch_id": None,
+            "abandoned_branches": [],
+            "metaknowledge_holders": [],
+        },
+        "checkpoints": [],
+        "event_log": [],
+        "idempotency_keys": [],
     }
 
-# ── 状态读写 ──────────────────────────────────────────
 
-def load_state() -> dict:
-    """加载状态文件，不存在则返回 None"""
-    if STATE_FILE.exists():
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
+def migrate_state(raw: dict[str, Any]) -> dict[str, Any]:
+    """将 v2.0/v2.5 状态迁移到 v2.6，尽量保留已有数据。"""
+    if raw.get("schema_version") == SCHEMA_VERSION:
+        state = raw
+    else:
+        state = init_state(raw.get("session_id"), raw.get("seed"))
+        state["started_at"] = raw.get("started_at", state["started_at"])
+        state["total_rounds"] = int(raw.get("total_rounds", 0))
+        state["ats_window"] = list(raw.get("ats_window", []))[-WINDOW_SIZE:]
+        state["flow_state"] = raw.get("flow_state", "沉浸中")
+        state["flow_rounds_in_state"] = int(raw.get("flow_rounds_in_state", 0))
+        state["director"].update(raw.get("director", {}))
+        state["npc_attitude_log"] = list(raw.get("npc_attitude_log", []))
 
-def save_state(state: dict):
-    """持久化状态到文件"""
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+        old_items = raw.get("chekhov_items", {})
+        if isinstance(old_items, list):
+            for item in old_items:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or item.get("item") or "").strip()
+                if name:
+                    state["chekhov_items"][name] = item
+        elif isinstance(old_items, dict):
+            state["chekhov_items"] = old_items
 
-# ── @@s 解析 ─────────────────────────────────────────
+        old_cards = raw.get("cards", {})
+        if isinstance(old_cards, dict):
+            for card_id, runtime in old_cards.items():
+                spec = {"id": card_id}
+                if isinstance(runtime, dict):
+                    spec.update(runtime)
+                state["cards"][card_id] = normalize_card_spec(spec)
 
-def parse_ats(yaml_text: str) -> dict:
-    """从 @@s 隐藏层的 YAML 文本中解析结构化数据"""
-    data = {}
-    lines = yaml_text.strip().split("\n")
-    
-    current_key = None
-    current_list = []
-    current_dict = {}
-    in_list = False
-    in_dict = False
-    
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        
-        # 顶层键值对
-        if ":" in stripped and not stripped.startswith(" ") and not stripped.startswith("-"):
-            in_list = False
-            in_dict = False
-            key, _, val = stripped.partition(":")
-            key = key.strip()
-            val = val.strip().strip('"').strip("'")
-            
-            if val == "":
-                # 可能是列表或子字典的开始
-                current_key = key
-                data[key] = None
-            else:
-                # 简单数值或字符串
-                try:
-                    data[key] = int(val)
-                except ValueError:
-                    try:
-                        data[key] = float(val)
-                    except ValueError:
-                        data[key] = val
-                current_key = key
-        
-        # 列表项
-        elif stripped.startswith("- ") and current_key:
-            in_list = True
-            if data[current_key] is None:
-                data[current_key] = []
-            item = stripped[2:].strip().strip('"').strip("'")
-            data[current_key].append(item)
-    
-    return data
+        for key in ("pause", "timeline"):
+            if isinstance(raw.get(key), dict):
+                state[key].update(raw[key])
+        state["checkpoints"] = list(raw.get("checkpoints", []))
+        state["event_log"] = list(raw.get("event_log", []))[-EVENT_LOG_LIMIT:]
+        state["idempotency_keys"] = list(raw.get("idempotency_keys", []))[-IDEMPOTENCY_LIMIT:]
+
+    # 补齐未来版本新增键，避免半迁移状态崩溃
+    defaults = init_state(state.get("session_id"), state.get("seed"))
+    for key, value in defaults.items():
+        state.setdefault(key, copy.deepcopy(value))
+    for nested in ("pause", "director", "timeline"):
+        for key, value in defaults[nested].items():
+            state[nested].setdefault(key, copy.deepcopy(value))
+    state["schema_version"] = SCHEMA_VERSION
+    state["revision"] = int(state.get("revision", 0))
+    state["ats_window"] = list(state.get("ats_window", []))[-WINDOW_SIZE:]
+    state["event_log"] = list(state.get("event_log", []))[-EVENT_LOG_LIMIT:]
+    state["idempotency_keys"] = list(state.get("idempotency_keys", []))[-IDEMPOTENCY_LIMIT:]
+    return state
 
 
-def parse_ats_structured(yaml_text: str) -> dict:
-    """增强版 @@s 解析：处理嵌套结构（npc_attitude_shifts 等）"""
-    data = {
-        "scene_intensity": 5,
-        "chaos_proximity": 5,
-        "player_agency": 5,
-        "goal_progress": 50,
-        "active_npcs": {},
-        "npc_attitude_shifts": [],
-        "unresolved_chekhov": [],
-        "pending_flags": [],
-        "npc_reflections": []
-    }
-    
-    lines = yaml_text.strip().split("\n")
-    
-    # 简单键值对解析
-    simple_keys = {"scene_intensity", "chaos_proximity", "player_agency", "goal_progress"}
-    
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped == "@@s":
-            continue
-        
-        # 跳过嵌套结构（由更精细的解析处理）
-        if stripped.startswith("- ") and ("character:" in stripped or "item:" in stripped):
-            continue
-        
-        if ":" in stripped and not stripped.startswith("  "):
-            key, _, val = stripped.partition(":")
-            key = key.strip()
-            val = val.strip().strip('"').strip("'")
-            
-            if key in simple_keys and val:
-                try:
-                    data[key] = int(val)
-                except ValueError:
-                    pass
-    
-    # 简单提取 unresolved_chekhov 和 npc_attitude_shifts 的数量
-    # （完整解析可由 AI 在 @@s 输出时提供更结构化的格式）
-    
-    return data
+@contextlib.contextmanager
+def state_lock(state_file: Path) -> Iterator[None]:
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_file.with_suffix(state_file.suffix + ".lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock_fp:
+        if fcntl is not None:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
 
 
-# ── 窗口趋势分析 ──────────────────────────────────────
+def load_state(state_file: Path, required: bool = False) -> Optional[dict[str, Any]]:
+    if not state_file.exists():
+        if required:
+            raise FileNotFoundError(f"状态文件不存在：{state_file}")
+        return None
+    try:
+        with open(state_file, "r", encoding="utf-8") as fp:
+            raw = json.load(fp)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"状态文件 JSON 损坏：{exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("状态文件顶层必须是 JSON object")
+    return migrate_state(raw)
 
-def analyze_trends(ats_window: list) -> dict:
-    """分析 8 轮滑动窗口的四维趋势"""
-    if len(ats_window) < 4:
-        return {
-            "scene_intensity_trend": "→",
-            "chaos_proximity_trend": "→",
-            "player_agency_trend": "→",
-            "goal_progress_trend": "→"
+
+def atomic_save_state(state_file: Path, state: dict[str, Any]) -> None:
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state["updated_at"] = now_iso()
+    fd, temp_name = tempfile.mkstemp(
+        prefix=state_file.name + ".",
+        suffix=".tmp",
+        dir=str(state_file.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            json.dump(state, fp, ensure_ascii=False, indent=2)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(temp_name, state_file)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def append_event(state: dict[str, Any], event_type: str, payload: Optional[dict[str, Any]] = None) -> None:
+    state["event_log"].append(
+        {
+            "at": now_iso(),
+            "round": state["total_rounds"],
+            "revision": state["revision"],
+            "type": event_type,
+            "payload": payload or {},
         }
-    
-    trends = {}
-    keys = ["scene_intensity", "chaos_proximity", "player_agency", "goal_progress"]
-    trend_labels = {
+    )
+    state["event_log"] = state["event_log"][-EVENT_LOG_LIMIT:]
+
+
+def commit_state(state_file: Path, state: dict[str, Any], event_type: str, payload: Optional[dict[str, Any]] = None) -> None:
+    state["revision"] = int(state.get("revision", 0)) + 1
+    append_event(state, event_type, payload)
+    atomic_save_state(state_file, state)
+
+
+def parse_scalar(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return None
+    lowered = value.lower()
+    if lowered in {"null", "none", "~"}:
+        return None
+    if lowered in {"true", "yes"}:
+        return True
+    if lowered in {"false", "no"}:
+        return False
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        pass
+    return value.strip('"\'')
+
+
+def parse_legacy_yaml(text: str) -> dict[str, Any]:
+    """兼容旧版简单 YAML。复杂嵌套请改用 JSON。"""
+    result: dict[str, Any] = {}
+    current_key: Optional[str] = None
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        stripped = raw_line.strip()
+        if stripped == "@@s":
+            continue
+        if stripped.startswith("- ") and current_key:
+            result.setdefault(current_key, [])
+            if isinstance(result[current_key], list):
+                result[current_key].append(parse_scalar(stripped[2:]))
+            continue
+        if ":" in stripped:
+            key, value = stripped.split(":", 1)
+            key = key.strip()
+            current_key = key
+            parsed = parse_scalar(value)
+            result[key] = [] if parsed is None else parsed
+    return result
+
+
+def parse_patch(text: str) -> dict[str, Any]:
+    text = text.strip()
+    if not text:
+        raise ValueError("未收到状态补丁")
+    if text.startswith("@@s"):
+        text = text[3:].lstrip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            import yaml  # type: ignore
+        except ImportError:
+            data = parse_legacy_yaml(text)
+        else:
+            data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        raise ValueError("状态补丁顶层必须是 object")
+    if isinstance(data.get("state_patch"), dict):
+        data = data["state_patch"]
+    return data
+
+
+def clamp_number(value: Any, low: int, high: int, default: int) -> int:
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
+
+
+def normalize_metrics(patch: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "scene_intensity": clamp_number(patch.get("scene_intensity"), 1, 10, 5),
+        "chaos_proximity": clamp_number(patch.get("chaos_proximity"), 1, 10, 5),
+        "player_agency": clamp_number(patch.get("player_agency"), 1, 10, 5),
+        "goal_progress": clamp_number(patch.get("goal_progress"), 0, 100, 50),
+        "active_npcs": patch.get("active_npcs", {}),
+        "npc_attitude_shifts": patch.get("npc_attitude_shifts", []),
+        "pending_flags": patch.get("pending_flags", []),
+        "npc_reflections": patch.get("npc_reflections", []),
+        "branch_id": patch.get("branch_id"),
+    }
+
+
+def analyze_trends(window: list[dict[str, Any]]) -> dict[str, str]:
+    labels = {
         "scene_intensity": "scene_intensity_trend",
         "chaos_proximity": "chaos_proximity_trend",
         "player_agency": "player_agency_trend",
-        "goal_progress": "goal_progress_trend"
+        "goal_progress": "goal_progress_trend",
     }
-    
-    # 取前 N/2 轮和后 N/2 轮
-    mid = len(ats_window) // 2
-    early = ats_window[:mid]
-    recent = ats_window[mid:]
-    
-    for key in keys:
-        early_avg = sum(r.get(key, 5) for r in early) / len(early)
-        recent_avg = sum(r.get(key, 5) for r in recent) / len(recent)
+    if len(window) < 4:
+        return {label: "→" for label in labels.values()}
+
+    if len(window) >= 6:
+        early, recent = window[-6:-3], window[-3:]
+    else:
+        mid = len(window) // 2
+        early, recent = window[:mid], window[mid:]
+
+    trends: dict[str, str] = {}
+    for key, label in labels.items():
+        early_avg = sum(float(row.get(key, 5)) for row in early) / len(early)
+        recent_avg = sum(float(row.get(key, 5)) for row in recent) / len(recent)
         diff = recent_avg - early_avg
-        
-        if diff > 1.0:
-            trends[trend_labels[key]] = "↑"
-        elif diff < -1.0:
-            trends[trend_labels[key]] = "↓"
-        else:
-            trends[trend_labels[key]] = "→"
-    
+        trends[label] = "↑" if diff > 1.0 else "↓" if diff < -1.0 else "→"
     return trends
 
 
-def determine_flow_state(trends: dict, ats_window: list) -> str:
-    """根据趋势和数值判定心流状态"""
-    if len(ats_window) < 4:
+def determine_flow_state(trends: dict[str, str], window: list[dict[str, Any]]) -> str:
+    if len(window) < 4:
         return "沉浸中"
-    
-    latest = ats_window[-1]
-    si = latest.get("scene_intensity", 5)
-    cp = latest.get("chaos_proximity", 5)
-    pa = latest.get("player_agency", 5)
-    gp = latest.get("goal_progress", 50)
-    
+    latest = window[-1]
+    si = int(latest.get("scene_intensity", 5))
+    cp = int(latest.get("chaos_proximity", 5))
+    pa = int(latest.get("player_agency", 5))
     si_t = trends.get("scene_intensity_trend", "→")
     cp_t = trends.get("chaos_proximity_trend", "→")
     pa_t = trends.get("player_agency_trend", "→")
     gp_t = trends.get("goal_progress_trend", "→")
-    
-    # 🔴 趋近焦虑：失控度持续上升且掌控度持续下降
-    if cp_t == "↑" and pa_t == "↓" and cp >= 6:
+
+    if cp_t == "↑" and pa_t == "↓" and cp >= 7:
         return "趋近焦虑"
-    
-    # 🟡 趋近无聊：激烈度持续下降且目标无进展
-    if si_t == "↓" and gp_t == "→" and si <= 4:
+
+    recent4 = window[-4:]
+    gp_values4 = [int(row.get("goal_progress", 50)) for row in recent4]
+    if si_t == "↓" and gp_t == "→" and si <= 4 and max(gp_values4) - min(gp_values4) <= 5:
         return "趋近无聊"
-    
-    # 🟠 失去方向：目标停滞6轮+
-    if gp_t == "→" and pa_t == "→" and gp <= 30:
-        # 检查前面几轮是否也停滞
-        recent_gp = [r.get("goal_progress", 50) for r in ats_window[-4:]]
-        if max(recent_gp) - min(recent_gp) <= 10:
+
+    if len(window) >= 6:
+        recent6 = window[-6:]
+        gp_values6 = [int(row.get("goal_progress", 50)) for row in recent6]
+        pa_values6 = [int(row.get("player_agency", 5)) for row in recent6]
+        if max(gp_values6) - min(gp_values6) <= 5 and max(pa_values6) - min(pa_values6) <= 2:
             return "失去方向"
-    
-    # ⚪ 高能后回落：激烈度快速下降且掌控度上升
+
     if si_t == "↓" and pa_t == "↑":
-        prev_si = [r.get("scene_intensity", 5) for r in ats_window[-6:-3]]
-        if prev_si and max(prev_si) >= 7:
+        prior = window[-6:-3] if len(window) >= 6 else window[:-2]
+        if prior and sum(int(row.get("scene_intensity", 5)) for row in prior) / len(prior) >= 7:
             return "高能后回落"
-    
-    # 🟢 沉浸中：默认状态
+
     return "沉浸中"
 
 
-# ── 导演冷却管理 ──────────────────────────────────────
+def tick_cooldowns(state: dict[str, Any]) -> None:
+    director = state["director"]
+    for key in (
+        "action_cooldown_remaining",
+        "consecutive_silence_required",
+        "daily_transition_cooldown",
+        "push_recycle_cooldown",
+    ):
+        director[key] = max(0, int(director.get(key, 0)) - 1)
 
-def tick_cooldowns(state: dict):
-    """每轮推进所有冷却计数器 -1（最少到 0）"""
-    d = state["director"]
-    d["action_cooldown_remaining"] = max(0, d["action_cooldown_remaining"] - 1)
-    d["consecutive_silence_required"] = max(0, d["consecutive_silence_required"] - 1)
-    d["daily_transition_cooldown"] = max(0, d["daily_transition_cooldown"] - 1)
-    d["push_recycle_cooldown"] = max(0, d["push_recycle_cooldown"] - 1)
 
-def apply_director_action(state: dict, action: str):
-    """应用导演动作，设置对应的冷却"""
-    d = state["director"]
-    d["last_action"] = action
-    d["last_action_round"] = state["total_rounds"]
-    d["action_cooldown_remaining"] = L3_COOLDOWN_GENERAL
-    d["consecutive_interventions"] += 1
-    d["intervention_history"].append({
-        "round": state["total_rounds"],
-        "action": action
-    })
-    # 只保留最近 5 轮记录
-    if len(d["intervention_history"]) > 5:
-        d["intervention_history"] = d["intervention_history"][-5:]
-    
+def apply_director_action(state: dict[str, Any], action: Optional[str]) -> None:
+    director = state["director"]
+    if not action or action in {"none", "静默", "不干预"}:
+        director["rounds_since_intervention"] = int(director.get("rounds_since_intervention", 0)) + 1
+        if director["rounds_since_intervention"] >= 3:
+            director["consecutive_interventions"] = 0
+        return
+    if action not in VALID_ACTIONS:
+        raise ValueError(f"未知导演动作：{action}")
+
+    director["last_action"] = action
+    director["last_action_round"] = state["total_rounds"]
+    director["rounds_since_intervention"] = 0
+    director["action_cooldown_remaining"] = GENERAL_COOLDOWN
+    director["consecutive_interventions"] = int(director.get("consecutive_interventions", 0)) + 1
+    director["intervention_history"].append({"round": state["total_rounds"], "action": action})
+    director["intervention_history"] = director["intervention_history"][-8:]
+
     if action == "日常过渡":
-        d["daily_transition_cooldown"] = L3_DAILY_COOLDOWN
-    if action == "推动回收":
-        d["push_recycle_cooldown"] = L3_RECYCLE_COOLDOWN
-    
-    # 连续干预超限
-    if d["consecutive_interventions"] >= L3_CONSECUTIVE_MAX:
-        d["consecutive_silence_required"] = L3_CONSECUTIVE_SILENCE
-        d["consecutive_interventions"] = 0
+        director["daily_transition_cooldown"] = DAILY_COOLDOWN
+    elif action == "推动回收":
+        director["push_recycle_cooldown"] = RECYCLE_COOLDOWN
 
-def can_intervene(state: dict, action: str) -> tuple:
-    """检查导演是否可以干预。返回 (can, reason)"""
-    d = state["director"]
-    
-    # 强制静默
-    if d["consecutive_silence_required"] > 0:
-        return False, f"连续干预超限，强制静默 {d['consecutive_silence_required']} 轮"
-    
-    # 通用冷却
-    if d["action_cooldown_remaining"] > 0:
-        return False, f"通用冷却中，{d['action_cooldown_remaining']} 轮后可用"
-    
-    # 特定动作冷却
-    if action == "日常过渡" and d["daily_transition_cooldown"] > 0:
-        return False, f"日常过渡冷却中，{d['daily_transition_cooldown']} 轮后可用"
-    if action == "推动回收" and d["push_recycle_cooldown"] > 0:
-        return False, f"推动回收冷却中，{d['push_recycle_cooldown']} 轮后可用"
-    
-    # 防抽搐：同一场景内升压和降压不能连续交替
-    history = d["intervention_history"]
-    if len(history) >= 2:
-        last_two = [h["action"] for h in history[-2:]]
-        if last_two[-1] == "升压" and action == "降压":
-            return False, "防抽搐：上一轮刚升压，本轮不能降压"
-        if last_two[-1] == "降压" and action == "升压":
-            return False, "防抽搐：上一轮刚降压，本轮不能升压"
-    
+    if director["consecutive_interventions"] >= CONSECUTIVE_MAX:
+        director["consecutive_silence_required"] = CONSECUTIVE_SILENCE
+        director["consecutive_interventions"] = 0
+
+
+def can_intervene(state: dict[str, Any], action: Optional[str] = None) -> tuple[bool, str]:
+    pause = state["pause"]
+    if pause.get("status") == "PAUSED" or pause.get("level") in {"L1", "L2", "L4"}:
+        return False, f"暂停状态 {pause.get('level')}"
+
+    director = state["director"]
+    if int(director.get("consecutive_silence_required", 0)) > 0:
+        return False, f"强制静默 {director['consecutive_silence_required']} 轮"
+    if int(director.get("action_cooldown_remaining", 0)) > 0:
+        return False, f"通用冷却 {director['action_cooldown_remaining']} 轮"
+    if action == "日常过渡" and int(director.get("daily_transition_cooldown", 0)) > 0:
+        return False, f"日常过渡冷却 {director['daily_transition_cooldown']} 轮"
+    if action == "推动回收" and int(director.get("push_recycle_cooldown", 0)) > 0:
+        return False, f"推动回收冷却 {director['push_recycle_cooldown']} 轮"
+
+    last_action = director.get("last_action")
+    last_action_round = director.get("last_action_round")
+    recent_opposite = (
+        last_action_round is not None
+        and state["total_rounds"] - int(last_action_round) <= GENERAL_COOLDOWN + 1
+    )
+    if recent_opposite and (last_action, action) in {("升压", "降压"), ("降压", "升压")}:
+        return False, "防抽搐：最近一次干预方向相反"
     return True, "可以干预"
 
 
-# ── 契诃夫道具追踪 ────────────────────────────────────
+def deterministic_choice(state: dict[str, Any], choices: list[tuple[Optional[str], float]]) -> Optional[str]:
+    material = f"{state['seed']}|{state['total_rounds']}|{state['revision']}|{state['flow_state']}"
+    seed_int = int(hashlib.sha256(material.encode("utf-8")).hexdigest()[:16], 16)
+    rng = random.Random(seed_int)
+    total = sum(max(0.0, weight) for _, weight in choices)
+    if total <= 0:
+        return None
+    target = rng.random() * total
+    cumulative = 0.0
+    for action, weight in choices:
+        cumulative += max(0.0, weight)
+        if target <= cumulative:
+            return action
+    return choices[-1][0]
 
-def update_chekhov_items(state: dict, unresolved: list):
-    """更新契诃夫道具状态：已知道具 rounds_unused+1，新道具加入"""
-    existing_names = {item["name"] for item in state["chekhov_items"]}
-    
-    for item_data in unresolved:
-        name = item_data.get("item", item_data.get("name", ""))
-        if not name:
+
+def choose_director_action(state: dict[str, Any]) -> dict[str, Any]:
+    can, reason = can_intervene(state)
+    if not can:
+        return {"action": None, "reason": reason, "flow_state": state["flow_state"], "deterministic": True}
+
+    choices = list(ACTION_WEIGHTS.get(state["flow_state"], [(None, 1.0)]))
+    high_urgency = [
+        item for item in state["chekhov_items"].values()
+        if item.get("status") == "unresolved" and item.get("urgency") == "高"
+    ]
+    if high_urgency:
+        choices.append(("推动回收", 0.40))
+
+    # 先过滤动作专属冷却；None 永远可用
+    filtered: list[tuple[Optional[str], float]] = []
+    rejected: dict[str, str] = {}
+    for action, weight in choices:
+        if action is None:
+            filtered.append((action, weight))
             continue
-        
-        if name in existing_names:
-            # 已有道具：更新未使用轮次
-            for item in state["chekhov_items"]:
-                if item["name"] == name:
-                    if item["status"] == "unresolved":
-                        item["rounds_unused"] += 1
-                        # 更新紧迫度
-                        if item["rounds_unused"] >= 10:
-                            item["urgency"] = "高"
-                        elif item["rounds_unused"] >= 5:
-                            item["urgency"] = "中"
-                    break
+        allowed, action_reason = can_intervene(state, action)
+        if allowed:
+            filtered.append((action, weight))
         else:
-            # 新道具
-            state["chekhov_items"].append({
-                "name": name,
-                "acquired_round": state["total_rounds"],
-                "rounds_unused": 0,
-                "urgency": "低",
-                "status": "unresolved"
-            })
+            rejected[action] = action_reason
 
-def mark_chekhov_resolved(state: dict, item_name: str):
-    """标记道具已回收"""
-    for item in state["chekhov_items"]:
-        if item["name"] == item_name:
-            item["status"] = "resolved"
-            item["resolved_round"] = state["total_rounds"]
-            break
-
-# ── 剧情卡片追踪 ──────────────────────────────────────
-
-def register_card(state: dict, card_id: str, cooldown_rounds: int, max_triggers: int = 3):
-    """注册新卡片"""
-    state["cards"][card_id] = {
-        "times_triggered": 0,
-        "last_triggered_round": None,
-        "cooldown_rounds": cooldown_rounds,
-        "cooldown_until_round": None,
-        "max_triggers": max_triggers
+    action = deterministic_choice(state, filtered) if filtered else None
+    return {
+        "action": action,
+        "reason": f"心流={state['flow_state']}；按 session seed 可复现抽取",
+        "flow_state": state["flow_state"],
+        "deterministic": True,
+        "high_urgency_chekhov": [item["name"] for item in high_urgency],
+        "rejected_actions": rejected,
     }
 
-def can_trigger_card(state: dict, card_id: str) -> tuple:
-    """检查卡片是否可以触发"""
-    if card_id not in state["cards"]:
-        return True, "未注册卡片，默认可触发"
-    
-    card = state["cards"][card_id]
-    
-    # 达到最大触发次数
-    if card["max_triggers"] > 0 and card["times_triggered"] >= card["max_triggers"]:
-        return False, f"已达最大触发次数 {card['max_triggers']}"
-    
-    # 冷却中
-    if card["cooldown_until_round"] and state["total_rounds"] < card["cooldown_until_round"]:
-        remaining = card["cooldown_until_round"] - state["total_rounds"]
-        return False, f"冷却中，{remaining} 轮后可用"
-    
+
+def urgency_from_rounds(rounds_unused: int) -> str:
+    if rounds_unused >= 10:
+        return "高"
+    if rounds_unused >= 5:
+        return "中"
+    return "低"
+
+
+def tick_chekhov_items(state: dict[str, Any]) -> None:
+    for item in state["chekhov_items"].values():
+        if item.get("status") == "unresolved":
+            item["rounds_unused"] = int(item.get("rounds_unused", 0)) + 1
+            item["urgency"] = urgency_from_rounds(item["rounds_unused"])
+
+
+def add_or_refresh_chekhov(state: dict[str, Any], item_data: Any) -> None:
+    if isinstance(item_data, str):
+        item_data = {"name": item_data}
+    if not isinstance(item_data, dict):
+        return
+    name = str(item_data.get("name") or item_data.get("item") or "").strip()
+    if not name:
+        return
+    item = state["chekhov_items"].setdefault(
+        name,
+        {
+            "name": name,
+            "acquired_round": state["total_rounds"],
+            "rounds_unused": 0,
+            "urgency": "低",
+            "status": "unresolved",
+            "branch_id": state["timeline"]["current_branch_id"],
+        },
+    )
+    item["status"] = "unresolved"
+    item["last_seen_round"] = state["total_rounds"]
+    for key in ("description", "related_characters", "scene_id"):
+        if key in item_data:
+            item[key] = item_data[key]
+
+
+def resolve_chekhov(state: dict[str, Any], name: str) -> None:
+    item = state["chekhov_items"].get(name)
+    if item:
+        item["status"] = "resolved"
+        item["resolved_round"] = state["total_rounds"]
+
+
+def normalize_card_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    card_id = str(spec.get("id") or spec.get("card_id") or "").strip()
+    if not card_id:
+        raise ValueError("剧情卡缺少 id")
+    priority = spec.get("priority", "中")
+    if priority not in {"高", "中", "低"}:
+        priority = "中"
+    position = spec.get("inject_position", "recent_focus")
+    if position not in VALID_CARD_POSITIONS:
+        position = "recent_focus"
+    delay_mode = spec.get("delay_mode", "latched")
+    if delay_mode not in VALID_DELAY_MODES:
+        delay_mode = "latched"
+
+    return {
+        "id": card_id,
+        "type": spec.get("type", "world_event"),
+        "trigger_hint": spec.get("trigger_hint", ""),
+        "director_action": spec.get("director_action", "任意"),
+        "priority": priority,
+        "cooldown_rounds": max(0, int(spec.get("cooldown_rounds", 0))),
+        "max_triggers": max(0, int(spec.get("max_triggers", 0))),  # 0 = 无限
+        "content": spec.get("content", ""),
+        "required_conditions": list(spec.get("required_conditions", [])),
+        "required_absent": list(spec.get("required_absent", [])),
+        "sticky_rounds": max(0, int(spec.get("sticky_rounds", 0))),
+        "delay_rounds": max(0, int(spec.get("delay_rounds", 0))),
+        "delay_mode": delay_mode,
+        "chain_triggers": list(spec.get("chain_triggers", [])),
+        "inject_position": position,
+        "inject_order": int(spec.get("inject_order", 300 if position == "recent_focus" else 100)),
+        "times_triggered": int(spec.get("times_triggered", 0)),
+        "last_triggered_round": spec.get("last_triggered_round"),
+        "cooldown_until_round": spec.get("cooldown_until_round"),
+        "condition_first_met_round": spec.get("condition_first_met_round"),
+        "conditions_met": bool(
+            spec.get(
+                "conditions_met",
+                not spec.get("required_conditions") and not spec.get("required_absent"),
+            )
+        ),
+        "sticky_until_round": spec.get("sticky_until_round"),
+        "last_chain_depth": int(spec.get("last_chain_depth", 0)),
+        "enabled": bool(spec.get("enabled", True)),
+    }
+
+
+def register_cards(state: dict[str, Any], specs: Iterable[dict[str, Any]]) -> list[str]:
+    registered: list[str] = []
+    for raw_spec in specs:
+        spec = normalize_card_spec(raw_spec)
+        existing = state["cards"].get(spec["id"], {})
+        # 保留运行时统计，除非调用方明确提供
+        for key in (
+            "times_triggered",
+            "last_triggered_round",
+            "cooldown_until_round",
+            "condition_first_met_round",
+            "conditions_met",
+            "sticky_until_round",
+            "last_chain_depth",
+        ):
+            if key not in raw_spec and key in existing:
+                spec[key] = existing[key]
+        if spec["conditions_met"] and spec.get("condition_first_met_round") is None:
+            spec["condition_first_met_round"] = state["total_rounds"]
+        state["cards"][spec["id"]] = spec
+        registered.append(spec["id"])
+    return registered
+
+
+def update_card_condition(state: dict[str, Any], card_id: str, met: bool) -> None:
+    card = state["cards"].get(card_id)
+    if not card:
+        raise KeyError(f"剧情卡未注册：{card_id}")
+    card["conditions_met"] = bool(met)
+    if met:
+        if card.get("condition_first_met_round") is None:
+            card["condition_first_met_round"] = state["total_rounds"]
+    elif card.get("delay_mode") == "continuous":
+        card["condition_first_met_round"] = None
+
+
+def card_chain_boost(state: dict[str, Any], card_id: str) -> tuple[float, int]:
+    current_round = state["total_rounds"]
+    best_depth = 0
+    for entry in state["chain_queue"]:
+        if entry.get("card_id") == card_id and int(entry.get("activate_round", 0)) <= current_round <= int(entry.get("expires_round", 0)):
+            best_depth = max(best_depth, int(entry.get("depth", 1)))
+    return (1.5 if best_depth else 1.0), best_depth
+
+
+def can_trigger_card(state: dict[str, Any], card_id: str) -> tuple[bool, str]:
+    card = state["cards"].get(card_id)
+    if not card:
+        return False, "剧情卡未注册"
+    if not card.get("enabled", True):
+        return False, "剧情卡已禁用"
+    if card.get("sticky_until_round") is not None and state["total_rounds"] <= int(card["sticky_until_round"]):
+        return False, "sticky 余波中"
+    max_triggers = int(card.get("max_triggers", 0))
+    if max_triggers > 0 and int(card.get("times_triggered", 0)) >= max_triggers:
+        return False, f"已达最大触发次数 {max_triggers}"
+    cooldown_until = card.get("cooldown_until_round")
+    if cooldown_until is not None and state["total_rounds"] <= int(cooldown_until):
+        remaining = int(cooldown_until) - state["total_rounds"] + 1
+        return False, f"冷却中，还需 {remaining} 轮"
+    if not card.get("conditions_met", False):
+        return False, "触发条件未满足"
+    first_met = card.get("condition_first_met_round")
+    if first_met is None:
+        return False, "尚未记录条件首次满足轮次"
+    ready_round = int(first_met) + int(card.get("delay_rounds", 0))
+    if state["total_rounds"] < ready_round:
+        return False, f"delay 等待中，第 {ready_round} 轮可触发"
     return True, "可以触发"
 
-def trigger_card(state: dict, card_id: str):
-    """记录卡片触发"""
-    if card_id not in state["cards"]:
-        register_card(state, card_id, cooldown_rounds=5)  # 自动注册
-    
-    card = state["cards"][card_id]
-    card["times_triggered"] += 1
-    card["last_triggered_round"] = state["total_rounds"]
-    card["cooldown_until_round"] = state["total_rounds"] + card["cooldown_rounds"]
 
-def get_card_freshness(state: dict, card_id: str) -> float:
-    """计算卡片新鲜度得分 (0-1)"""
-    if card_id not in state["cards"]:
-        return 1.0  # 未注册 → 全新
-    
-    card = state["cards"][card_id]
-    if card["times_triggered"] == 0:
+def get_card_freshness(state: dict[str, Any], card_id: str) -> float:
+    card = state["cards"].get(card_id)
+    if not card or int(card.get("times_triggered", 0)) == 0:
         return 1.0
-    
-    rounds_since = state["total_rounds"] - (card["last_triggered_round"] or 0)
-    cooldown = card["cooldown_rounds"]
-    if cooldown == 0:
+    cooldown = int(card.get("cooldown_rounds", 0))
+    if cooldown <= 0:
+        return 1.0
+    last = int(card.get("last_triggered_round") or 0)
+    rounds_since = max(0, state["total_rounds"] - last)
+    return min(1.0, 0.7 + min(1.0, rounds_since / cooldown) * 0.3)
+
+
+def action_match_score(card_action: str, director_action: Optional[str]) -> float:
+    if card_action in {None, "任意", "any"}:
         return 0.5
-    return min(1.0, 0.7 + (rounds_since / cooldown) * 0.3)
+    if director_action and card_action == director_action:
+        return 1.0
+    return 0.0
 
 
-# ── 主更新流程 ─────────────────────────────────────────
+def priority_score(priority: str) -> float:
+    return {"高": 1.0, "中": 0.6, "低": 0.3}.get(priority, 0.6)
 
-def update(ats_yaml: str, last_action: str = None, triggered_card: str = None) -> dict:
-    """
-    主更新入口：每轮调用一次。
-    
-    参数:
-        ats_yaml: @@s 隐藏层的 YAML 文本
-        last_action: 上轮 AI 选择的导演动作（本轮更新时传入）
-        triggered_card: 上轮触发的卡片 ID
-    
-    返回:
-        snapshot: 给 AI 读的状态快照（dict）
-    """
-    state = load_state()
-    if state is None:
-        print("⚠️ 状态文件不存在，请先执行 init")
-        return None
-    
-    # 1. 推进冷却计数
+
+def select_card(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    director_action = payload.get("director_action")
+    candidates = payload.get("candidates", [])
+    allow_semantic_breakthrough = bool(payload.get("allow_semantic_breakthrough", True))
+    scored: list[dict[str, Any]] = []
+    excluded: list[dict[str, str]] = []
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        card_id = str(candidate.get("card_id") or candidate.get("id") or "")
+        card = state["cards"].get(card_id)
+        if not card:
+            excluded.append({"card_id": card_id, "reason": "未注册"})
+            continue
+        can, reason = can_trigger_card(state, card_id)
+        if not can:
+            excluded.append({"card_id": card_id, "reason": reason})
+            continue
+
+        semantic = max(0.0, min(1.0, float(candidate.get("semantic", 0.0))))
+        chain_multiplier, chain_depth = card_chain_boost(state, card_id)
+        semantic_effective = min(1.0, semantic * chain_multiplier)
+        action_score = action_match_score(str(card.get("director_action", "任意")), director_action)
+        fresh = get_card_freshness(state, card_id)
+        total = (
+            semantic_effective * 0.40
+            + action_score * 0.30
+            + priority_score(str(card.get("priority", "中"))) * 0.20
+            + fresh * 0.10
+        )
+        scored.append(
+            {
+                "card_id": card_id,
+                "score": round(total, 4),
+                "semantic": round(semantic, 4),
+                "semantic_effective": round(semantic_effective, 4),
+                "action_match": action_score,
+                "priority": priority_score(str(card.get("priority", "中"))),
+                "freshness": round(fresh, 4),
+                "chain_depth": chain_depth,
+                "inject_position": card["inject_position"],
+                "inject_order": card["inject_order"],
+            }
+        )
+
+    scored.sort(key=lambda row: (row["score"], row["inject_order"], row["card_id"]), reverse=True)
+    selected = scored[0] if scored else None
+    if selected and not director_action and allow_semantic_breakthrough:
+        original_semantic = selected["semantic"]
+        if original_semantic <= 0.85:
+            selected = None
+    elif selected and not director_action:
+        selected = None
+
+    return {"selected": selected, "ranking": scored, "excluded": excluded}
+
+
+def trigger_card(state: dict[str, Any], card_id: str, chain_depth: int = 0) -> None:
+    can, reason = can_trigger_card(state, card_id)
+    if not can:
+        raise ValueError(f"剧情卡 {card_id} 不可触发：{reason}")
+    card = state["cards"][card_id]
+    card["times_triggered"] = int(card.get("times_triggered", 0)) + 1
+    card["last_triggered_round"] = state["total_rounds"]
+    card["cooldown_until_round"] = state["total_rounds"] + int(card.get("cooldown_rounds", 0))
+    sticky_rounds = int(card.get("sticky_rounds", 0))
+    card["sticky_until_round"] = state["total_rounds"] + sticky_rounds if sticky_rounds > 0 else None
+    card["last_chain_depth"] = chain_depth
+    has_dynamic_conditions = bool(card.get("required_conditions") or card.get("required_absent"))
+    card["conditions_met"] = not has_dynamic_conditions
+    card["condition_first_met_round"] = state["total_rounds"] if not has_dynamic_conditions else None
+
+    if chain_depth < CHAIN_DEPTH_LIMIT:
+        for child_id in card.get("chain_triggers", []):
+            state["chain_queue"].append(
+                {
+                    "card_id": child_id,
+                    "source_card_id": card_id,
+                    "depth": chain_depth + 1,
+                    "activate_round": state["total_rounds"] + 1,
+                    "expires_round": state["total_rounds"] + CHAIN_QUEUE_TTL,
+                }
+            )
+
+
+def prune_card_runtime(state: dict[str, Any]) -> None:
+    current = state["total_rounds"]
+    state["chain_queue"] = [entry for entry in state["chain_queue"] if int(entry.get("expires_round", -1)) >= current]
+    for card in state["cards"].values():
+        sticky_until = card.get("sticky_until_round")
+        if sticky_until is not None and current > int(sticky_until):
+            card["sticky_until_round"] = None
+
+
+def update_pause(state: dict[str, Any], patch: dict[str, Any]) -> None:
+    pause_patch = patch.get("pause")
+    if not isinstance(pause_patch, dict):
+        return
+    level = pause_patch.get("level")
+    if level is not None:
+        if level not in VALID_PAUSE_LEVELS:
+            raise ValueError(f"未知暂停层级：{level}")
+        state["pause"]["level"] = level
+    status = pause_patch.get("status")
+    if status is not None:
+        if status not in {"RUNNING", "PAUSED"}:
+            raise ValueError(f"未知暂停状态：{status}")
+        state["pause"]["status"] = status
+    for key in ("auto_advance_count", "cooldown_threshold"):
+        if key in pause_patch:
+            state["pause"][key] = max(0, int(pause_patch[key]))
+
+
+def snapshot_core(state: dict[str, Any]) -> dict[str, Any]:
+    excluded = {"checkpoints", "event_log", "idempotency_keys"}
+    return {key: copy.deepcopy(value) for key, value in state.items() if key not in excluded}
+
+
+def create_checkpoint(state: dict[str, Any], label: str, kind: str = "ckpt") -> dict[str, Any]:
+    checkpoint_id = f"{kind}_{uuid.uuid4().hex[:8]}"
+    checkpoint = {
+        "checkpoint_id": checkpoint_id,
+        "kind": kind,
+        "label": label,
+        "round": state["total_rounds"],
+        "revision": state["revision"],
+        "created_at": now_iso(),
+        "branch_id": state["timeline"]["current_branch_id"],
+        "snapshot": snapshot_core(state),
+    }
+    state["checkpoints"].append(checkpoint)
+
+    same_kind = [cp for cp in state["checkpoints"] if cp.get("kind") == kind]
+    if len(same_kind) > CHECKPOINT_LIMIT_PER_KIND:
+        remove_ids = {cp["checkpoint_id"] for cp in same_kind[:-CHECKPOINT_LIMIT_PER_KIND]}
+        state["checkpoints"] = [cp for cp in state["checkpoints"] if cp["checkpoint_id"] not in remove_ids]
+    return checkpoint
+
+
+def find_checkpoint(state: dict[str, Any], checkpoint_id: str) -> dict[str, Any]:
+    for checkpoint in state["checkpoints"]:
+        if checkpoint.get("checkpoint_id") == checkpoint_id:
+            return checkpoint
+    raise KeyError(f"找不到回滚点：{checkpoint_id}")
+
+
+def rollback_checkpoint(state: dict[str, Any], checkpoint_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    target = find_checkpoint(state, checkpoint_id)
+    checkpoints = copy.deepcopy(state["checkpoints"])
+    event_log = copy.deepcopy(state["event_log"])
+    idempotency = copy.deepcopy(state["idempotency_keys"])
+    session_id = state["session_id"]
+    seed = state["seed"]
+    current_revision = state["revision"]
+    old_branch = state["timeline"]["current_branch_id"]
+
+    safety = create_checkpoint(state, f"回滚前安全备份：{checkpoint_id}", "rollback_safety")
+    checkpoints = copy.deepcopy(state["checkpoints"])
+
+    restored = migrate_state(copy.deepcopy(target["snapshot"]))
+    restored["session_id"] = session_id
+    restored["seed"] = seed
+    restored["revision"] = current_revision
+    restored["checkpoints"] = checkpoints
+    restored["event_log"] = event_log
+    restored["idempotency_keys"] = idempotency
+
+    target_branch = target.get("branch_id")
+    new_branch = _new_branch_id()
+    abandoned = list(restored["timeline"].get("abandoned_branches", []))
+    abandoned.append(
+        {
+            "branch_id": old_branch,
+            "abandoned_at": now_iso(),
+            "rollback_target": checkpoint_id,
+        }
+    )
+    restored["timeline"]["parent_branch_id"] = target_branch
+    restored["timeline"]["current_branch_id"] = new_branch
+    restored["timeline"]["abandoned_branches"] = abandoned[-50:]
+    return restored, safety
+
+
+def validate_revision(state: dict[str, Any], expected_revision: Optional[int]) -> None:
+    if expected_revision is not None and int(state["revision"]) != int(expected_revision):
+        raise RuntimeError(
+            f"revision 冲突：期望 {expected_revision}，实际 {state['revision']}。"
+            "请重新读取状态后再提交。"
+        )
+
+
+def check_idempotency(state: dict[str, Any], key: Optional[str]) -> bool:
+    return bool(key and key in state["idempotency_keys"])
+
+
+def remember_idempotency(state: dict[str, Any], key: Optional[str]) -> None:
+    if not key:
+        return
+    state["idempotency_keys"].append(key)
+    state["idempotency_keys"] = state["idempotency_keys"][-IDEMPOTENCY_LIMIT:]
+
+
+def apply_update(
+    state: dict[str, Any],
+    patch: dict[str, Any],
+    last_action: Optional[str] = None,
+    triggered_card: Optional[str] = None,
+) -> dict[str, Any]:
     tick_cooldowns(state)
-    
-    # 2. 如果上轮有导演动作，应用冷却
-    if last_action:
-        apply_director_action(state, last_action)
-    
-    # 3. 如果上轮触发了卡片，记录
-    if triggered_card:
-        trigger_card(state, triggered_card)
-    
-    # 4. 解析 @@s 数据
-    ats_data = parse_ats_structured(ats_yaml)
-    
-    # 5. 更新窗口
-    state["ats_window"].append(ats_data)
-    if len(state["ats_window"]) > WINDOW_SIZE:
-        state["ats_window"] = state["ats_window"][-WINDOW_SIZE:]
-    
-    # 6. 更新契诃夫道具
-    unresolved = ats_data.get("unresolved_chekhov", [])
-    if unresolved:
-        update_chekhov_items(state, unresolved)
-    
-    # 7. 更新轮次
+    tick_chekhov_items(state)
+    prune_card_runtime(state)
+    apply_director_action(state, last_action)
+
+    # 先推进到新轮次，再记录本轮产生的数据；所有 round 字段语义一致
     state["total_rounds"] += 1
-    
-    # 8. 分析趋势
+    prune_card_runtime(state)
+
+    metrics = normalize_metrics(patch)
+    if metrics.get("branch_id") and metrics["branch_id"] != state["timeline"]["current_branch_id"]:
+        raise ValueError("状态补丁 branch_id 与当前分支不一致")
+    state["ats_window"].append(metrics)
+    state["ats_window"] = state["ats_window"][-WINDOW_SIZE:]
+
+    update_pause(state, patch)
+
+    additions = patch.get("chekhov_add", patch.get("unresolved_chekhov", []))
+    if isinstance(additions, (str, dict)):
+        additions = [additions]
+    for item in additions or []:
+        add_or_refresh_chekhov(state, item)
+
+    resolutions = patch.get("chekhov_resolve", patch.get("resolved_chekhov", []))
+    if isinstance(resolutions, str):
+        resolutions = [resolutions]
+    for name in resolutions or []:
+        resolve_chekhov(state, str(name))
+
+    conditions = patch.get("card_conditions", {})
+    if isinstance(conditions, dict):
+        for card_id, met in conditions.items():
+            update_card_condition(state, card_id, bool(met))
+
+    if triggered_card:
+        trigger_card(state, triggered_card, int(patch.get("chain_depth", 0)))
+
+    shifts = metrics.get("npc_attitude_shifts")
+    if isinstance(shifts, list):
+        for shift in shifts:
+            state["npc_attitude_log"].append(
+                {"round": state["total_rounds"], "branch_id": state["timeline"]["current_branch_id"], "data": shift}
+            )
+        state["npc_attitude_log"] = state["npc_attitude_log"][-200:]
+
     trends = analyze_trends(state["ats_window"])
-    
-    # 9. 判定心流状态
     flow = determine_flow_state(trends, state["ats_window"])
     if flow == state["flow_state"]:
         state["flow_rounds_in_state"] += 1
     else:
         state["flow_state"] = flow
         state["flow_rounds_in_state"] = 1
-    
-    # 10. 持久化
-    save_state(state)
-    
-    # 11. 构建快照
-    snapshot = build_snapshot(state, ats_data, trends)
-    return snapshot
+
+    return build_snapshot(state, metrics, trends)
 
 
-def build_snapshot(state: dict, ats_data: dict, trends: dict) -> dict:
-    """构建给 AI 读的状态快照"""
-    d = state["director"]
-    window = state["ats_window"]
-    
-    snapshot = {
+def build_snapshot(state: dict[str, Any], metrics: Optional[dict[str, Any]] = None, trends: Optional[dict[str, str]] = None) -> dict[str, Any]:
+    metrics = metrics or (state["ats_window"][-1] if state["ats_window"] else {})
+    trends = trends or analyze_trends(state["ats_window"])
+    director = state["director"]
+    unresolved = [item for item in state["chekhov_items"].values() if item.get("status") == "unresolved"]
+    sticky = []
+    delay = []
+    for card_id, card in state["cards"].items():
+        if card.get("sticky_until_round") is not None:
+            sticky.append({"card_id": card_id, "until_round": card["sticky_until_round"]})
+        if card.get("condition_first_met_round") is not None and int(card.get("delay_rounds", 0)) > 0:
+            delay.append(
+                {
+                    "card_id": card_id,
+                    "first_met_round": card["condition_first_met_round"],
+                    "ready_round": int(card["condition_first_met_round"]) + int(card["delay_rounds"]),
+                    "mode": card["delay_mode"],
+                }
+            )
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "revision": state["revision"],
+        "session_id": state["session_id"],
         "round": state["total_rounds"],
+        "branch_id": state["timeline"]["current_branch_id"],
         "flow_state": state["flow_state"],
         "flow_rounds_in_state": state["flow_rounds_in_state"],
-        
-        # 当前 @@s 数值
         "current_values": {
-            "scene_intensity": ats_data.get("scene_intensity", 5),
-            "chaos_proximity": ats_data.get("chaos_proximity", 5),
-            "player_agency": ats_data.get("player_agency", 5),
-            "goal_progress": ats_data.get("goal_progress", 50)
+            key: metrics.get(key, default)
+            for key, default in (
+                ("scene_intensity", 5),
+                ("chaos_proximity", 5),
+                ("player_agency", 5),
+                ("goal_progress", 50),
+            )
         },
-        
-        # 窗口趋势
         "trends": trends,
-        
-        # 导演冷却状态
+        "pause": copy.deepcopy(state["pause"]),
         "director_cooldowns": {
-            "can_intervene": d["action_cooldown_remaining"] == 0 and d["consecutive_silence_required"] == 0,
-            "general_cooldown": d["action_cooldown_remaining"],
-            "silence_required": d["consecutive_silence_required"],
-            "daily_transition_cooldown": d["daily_transition_cooldown"],
-            "push_recycle_cooldown": d["push_recycle_cooldown"],
-            "consecutive_interventions": d["consecutive_interventions"],
-            "last_action": d["last_action"],
-            "last_action_round": d["last_action_round"]
+            "can_intervene": can_intervene(state)[0],
+            "general_cooldown": director["action_cooldown_remaining"],
+            "silence_required": director["consecutive_silence_required"],
+            "daily_transition_cooldown": director["daily_transition_cooldown"],
+            "push_recycle_cooldown": director["push_recycle_cooldown"],
+            "last_action": director["last_action"],
+            "last_action_round": director["last_action_round"],
         },
-        
-        # 契诃夫道具
-        "chekhov_items": [
-            item for item in state["chekhov_items"] if item["status"] == "unresolved"
-        ],
-        "high_urgency_chekhov": [
-            item for item in state["chekhov_items"] 
-            if item["status"] == "unresolved" and item["urgency"] == "高"
-        ],
-        
-        # 卡片状态
+        "chekhov_items": unresolved,
+        "high_urgency_chekhov": [item for item in unresolved if item.get("urgency") == "高"],
         "cards_summary": {
             card_id: {
-                "times_triggered": info["times_triggered"],
+                "times_triggered": card["times_triggered"],
                 "can_trigger": can_trigger_card(state, card_id)[0],
-                "freshness": round(get_card_freshness(state, card_id), 2)
+                "can_trigger_reason": can_trigger_card(state, card_id)[1],
+                "freshness": round(get_card_freshness(state, card_id), 3),
             }
-            for card_id, info in state["cards"].items()
+            for card_id, card in state["cards"].items()
+        },
+        "sticky_active": sticky,
+        "delay_waiting": delay,
+        "chain_queue": copy.deepcopy(state["chain_queue"]),
+    }
+
+
+def read_stdin_json_or_text() -> str:
+    return sys.stdin.read().strip()
+
+
+def output_json(data: Any) -> None:
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    state_file = args.state_file
+    with state_lock(state_file):
+        if state_file.exists() and not args.force:
+            raise FileExistsError(f"状态文件已存在：{state_file}；使用 --force 覆盖")
+        state = init_state(args.session_id, args.seed)
+        atomic_save_state(state_file, state)
+    output_json({"ok": True, "state_file": str(state_file), "session_id": state["session_id"], "seed": state["seed"]})
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    text = read_stdin_json_or_text()
+    patch = parse_patch(text)
+    last_action = args.action or args.legacy_action
+    triggered_card = args.card or args.legacy_card
+    if isinstance(last_action, str) and last_action.lower() in {"none", "null", "静默", "不干预"}:
+        last_action = None
+    if isinstance(triggered_card, str) and triggered_card.lower() in {"none", "null", "无"}:
+        triggered_card = None
+    with state_lock(args.state_file):
+        state = load_state(args.state_file, required=True)
+        assert state is not None
+        validate_revision(state, args.expected_revision)
+        if check_idempotency(state, args.idempotency_key):
+            output_json({"ok": True, "duplicate": True, "revision": state["revision"], "snapshot": build_snapshot(state)})
+            return
+        snapshot = apply_update(state, patch, last_action, triggered_card)
+        remember_idempotency(state, args.idempotency_key)
+        commit_state(
+            args.state_file,
+            state,
+            "round_update",
+            {"action": last_action, "triggered_card": triggered_card, "idempotency_key": args.idempotency_key},
+        )
+        snapshot["revision"] = state["revision"]
+    output_json({"ok": True, "duplicate": False, "snapshot": snapshot})
+
+
+def cmd_decide(args: argparse.Namespace) -> None:
+    state = load_state(args.state_file, required=True)
+    assert state is not None
+    output_json({"ok": True, "revision": state["revision"], "decision": choose_director_action(state)})
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    state = load_state(args.state_file, required=True)
+    assert state is not None
+    if args.json:
+        output_json({"ok": True, "snapshot": build_snapshot(state)})
+        return
+    snap = build_snapshot(state)
+    values = snap["current_values"]
+    print("═" * 46)
+    print(f"  镜界导演状态 · Round {snap['round']} · rev {snap['revision']}")
+    print("═" * 46)
+    print(f"  会话: {snap['session_id']}  分支: {snap['branch_id']}")
+    print(f"  心流: {snap['flow_state']} ({snap['flow_rounds_in_state']}轮)")
+    print(f"  激烈 {values['scene_intensity']} | 失控 {values['chaos_proximity']} | 掌控 {values['player_agency']} | 目标 {values['goal_progress']}%")
+    print(f"  暂停: {snap['pause']['level']} / {snap['pause']['status']}")
+    print(f"  上次动作: {snap['director_cooldowns']['last_action'] or '无'}")
+    print(f"  通用冷却: {snap['director_cooldowns']['general_cooldown']} | 强制静默: {snap['director_cooldowns']['silence_required']}")
+    print(f"  未回收伏笔: {len(snap['chekhov_items'])} | 卡片: {len(snap['cards_summary'])}")
+    print("═" * 46)
+
+
+def cmd_register_cards(args: argparse.Namespace) -> None:
+    text = read_stdin_json_or_text()
+    data = json.loads(text)
+    specs = data if isinstance(data, list) else [data]
+    if not all(isinstance(spec, dict) for spec in specs):
+        raise ValueError("card-register 需要 JSON object 或 object array")
+    with state_lock(args.state_file):
+        state = load_state(args.state_file, required=True)
+        assert state is not None
+        validate_revision(state, args.expected_revision)
+        ids = register_cards(state, specs)
+        commit_state(args.state_file, state, "cards_registered", {"card_ids": ids})
+    output_json({"ok": True, "registered": ids, "revision": state["revision"]})
+
+
+def cmd_card_condition(args: argparse.Namespace) -> None:
+    met = args.value == "met"
+    with state_lock(args.state_file):
+        state = load_state(args.state_file, required=True)
+        assert state is not None
+        validate_revision(state, args.expected_revision)
+        update_card_condition(state, args.card_id, met)
+        commit_state(args.state_file, state, "card_condition", {"card_id": args.card_id, "met": met})
+    output_json({"ok": True, "card_id": args.card_id, "met": met, "revision": state["revision"]})
+
+
+
+def cmd_card_conditions(args: argparse.Namespace) -> None:
+    payload = json.loads(read_stdin_json_or_text())
+    if not isinstance(payload, dict):
+        raise ValueError("card-conditions 需要 JSON object：{card_id: true/false}")
+    with state_lock(args.state_file):
+        state = load_state(args.state_file, required=True)
+        assert state is not None
+        validate_revision(state, args.expected_revision)
+        updated: dict[str, bool] = {}
+        for card_id, met in payload.items():
+            update_card_condition(state, str(card_id), bool(met))
+            updated[str(card_id)] = bool(met)
+        commit_state(args.state_file, state, "card_conditions", {"conditions": updated})
+    output_json({"ok": True, "updated": updated, "revision": state["revision"]})
+
+
+def cmd_pause_set(args: argparse.Namespace) -> None:
+    with state_lock(args.state_file):
+        state = load_state(args.state_file, required=True)
+        assert state is not None
+        validate_revision(state, args.expected_revision)
+        state["pause"]["level"] = args.level
+        state["pause"]["status"] = args.status
+        if args.reset_auto_count:
+            state["pause"]["auto_advance_count"] = 0
+        commit_state(
+            args.state_file,
+            state,
+            "pause_set",
+            {"level": args.level, "status": args.status, "reset_auto_count": args.reset_auto_count},
+        )
+    output_json({"ok": True, "pause": state["pause"], "revision": state["revision"]})
+
+def cmd_card_select(args: argparse.Namespace) -> None:
+    payload = json.loads(read_stdin_json_or_text())
+    if not isinstance(payload, dict):
+        raise ValueError("card-select 需要 JSON object")
+    state = load_state(args.state_file, required=True)
+    assert state is not None
+    output_json({"ok": True, "revision": state["revision"], "result": select_card(state, payload)})
+
+
+def cmd_card_trigger(args: argparse.Namespace) -> None:
+    with state_lock(args.state_file):
+        state = load_state(args.state_file, required=True)
+        assert state is not None
+        validate_revision(state, args.expected_revision)
+        trigger_card(state, args.card_id, args.chain_depth)
+        commit_state(args.state_file, state, "card_triggered", {"card_id": args.card_id, "chain_depth": args.chain_depth})
+    output_json({"ok": True, "card_id": args.card_id, "revision": state["revision"], "snapshot": build_snapshot(state)})
+
+
+def cmd_checkpoint_create(args: argparse.Namespace) -> None:
+    with state_lock(args.state_file):
+        state = load_state(args.state_file, required=True)
+        assert state is not None
+        validate_revision(state, args.expected_revision)
+        checkpoint = create_checkpoint(state, args.label, args.kind)
+        commit_state(args.state_file, state, "checkpoint_created", {"checkpoint_id": checkpoint["checkpoint_id"]})
+    output_json({"ok": True, "revision": state["revision"], "checkpoint": {k: v for k, v in checkpoint.items() if k != "snapshot"}})
+
+
+def cmd_checkpoint_list(args: argparse.Namespace) -> None:
+    state = load_state(args.state_file, required=True)
+    assert state is not None
+    checkpoints = [
+        {k: v for k, v in checkpoint.items() if k != "snapshot"}
+        for checkpoint in state["checkpoints"]
+        if args.kind is None or checkpoint.get("kind") == args.kind
+    ]
+    output_json({"ok": True, "revision": state["revision"], "checkpoints": checkpoints})
+
+
+def cmd_checkpoint_preview(args: argparse.Namespace) -> None:
+    state = load_state(args.state_file, required=True)
+    assert state is not None
+    checkpoint = find_checkpoint(state, args.checkpoint_id)
+    snap = checkpoint["snapshot"]
+    preview = {
+        "checkpoint_id": checkpoint["checkpoint_id"],
+        "kind": checkpoint["kind"],
+        "label": checkpoint["label"],
+        "round": checkpoint["round"],
+        "branch_id": checkpoint["branch_id"],
+        "flow_state": snap.get("flow_state"),
+        "pause": snap.get("pause"),
+        "chekhov_unresolved": [
+            name for name, item in snap.get("chekhov_items", {}).items() if item.get("status") == "unresolved"
+        ],
+        "cards_count": len(snap.get("cards", {})),
+    }
+    output_json({"ok": True, "preview": preview})
+
+
+def cmd_checkpoint_rollback(args: argparse.Namespace) -> None:
+    with state_lock(args.state_file):
+        state = load_state(args.state_file, required=True)
+        assert state is not None
+        validate_revision(state, args.expected_revision)
+        restored, safety = rollback_checkpoint(state, args.checkpoint_id)
+        commit_state(
+            args.state_file,
+            restored,
+            "checkpoint_rollback",
+            {"target": args.checkpoint_id, "safety": safety["checkpoint_id"], "new_branch": restored["timeline"]["current_branch_id"]},
+        )
+    output_json(
+        {
+            "ok": True,
+            "revision": restored["revision"],
+            "rolled_back_to": args.checkpoint_id,
+            "safety_checkpoint": safety["checkpoint_id"],
+            "new_branch_id": restored["timeline"]["current_branch_id"],
+            "snapshot": build_snapshot(restored),
         }
-    }
-    
-    return snapshot
+    )
 
 
-# ── 命令行接口 ─────────────────────────────────────────
+def cmd_clean(args: argparse.Namespace) -> None:
+    if not args.yes:
+        raise ValueError("clean 是破坏性操作，请加 --yes")
+    with state_lock(args.state_file):
+        if args.state_file.exists():
+            args.state_file.unlink()
+    output_json({"ok": True, "deleted": str(args.state_file)})
 
-def cmd_init():
-    """初始化：创建新的状态文件"""
-    import uuid
-    session_id = str(uuid.uuid4())[:8]
-    state = init_state(session_id)
-    save_state(state)
-    print(f"✅ 镜界导演状态已初始化 (session: {session_id})")
-    print(f"   状态文件: {STATE_FILE}")
 
-def cmd_update():
-    """更新：解析 stdin 中的 @@s YAML，更新状态，输出快照"""
-    ats_yaml = sys.stdin.read().strip()
-    if not ats_yaml:
-        print("❌ 未收到 @@s 数据，请通过 stdin 传入")
-        return
-    
-    # 从命令行参数或环境变量获取上轮信息
-    # 用法: python director_tracker.py update [last_action] [triggered_card]
-    last_action = None
-    triggered_card = None
-    
-    if len(sys.argv) >= 3:
-        last_action = sys.argv[2] if sys.argv[2] != "none" else None
-    if len(sys.argv) >= 4:
-        triggered_card = sys.argv[3] if sys.argv[3] != "none" else None
-    
-    # 环境变量作为备用
-    if not last_action:
-        last_action = os.environ.get("DIRECTOR_LAST_ACTION")
-    if not triggered_card:
-        triggered_card = os.environ.get("DIRECTOR_TRIGGERED_CARD")
-    
-    snapshot = update(ats_yaml, last_action, triggered_card)
-    if snapshot:
-        print(json.dumps(snapshot, ensure_ascii=False, indent=2))
-    else:
-        print("❌ 更新失败")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="镜界 v2.6 导演状态运行时")
+    parser.add_argument(
+        "--state-file",
+        type=lambda value: Path(value).expanduser().resolve(),
+        default=default_state_file(),
+        help="状态文件路径；也可使用 JINGJIE_STATE_FILE",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
 
-def cmd_status():
-    """读取当前状态并输出可读摘要"""
-    state = load_state()
-    if state is None:
-        print("❌ 状态文件不存在，请先 init")
-        return
-    
-    d = state["director"]
-    w = state["ats_window"]
-    
-    print(f"═══════════════════════════════════")
-    print(f"  🎬 导演状态 (Round {state['total_rounds']})")
-    print(f"═══════════════════════════════════")
-    print(f"  心流状态: {state['flow_state']} ({state['flow_rounds_in_state']}轮)")
-    print(f"")
-    if w:
-        latest = w[-1]
-        print(f"  激烈度: {latest.get('scene_intensity', '?')}  "
-              f"失控度: {latest.get('chaos_proximity', '?')}  "
-              f"掌控度: {latest.get('player_agency', '?')}  "
-              f"目标: {latest.get('goal_progress', '?')}%")
-    print(f"")
-    print(f"  上次动作: {d['last_action'] or '无'} (Round {d['last_action_round'] or '-'})")
-    print(f"  通用冷却: {d['action_cooldown_remaining']}轮")
-    print(f"  强制静默: {d['consecutive_silence_required']}轮")
-    print(f"  连续干预: {d['consecutive_interventions']}次")
-    print(f"  日常冷却: {d['daily_transition_cooldown']}轮")
-    print(f"  回收冷却: {d['push_recycle_cooldown']}轮")
-    print(f"")
-    unresolved = [i for i in state["chekhov_items"] if i["status"] == "unresolved"]
-    if unresolved:
-        print(f"  契诃夫道具 ({len(unresolved)}):")
-        for item in unresolved:
-            print(f"    - {item['name']}: {item['rounds_unused']}轮未用 (紧迫度:{item['urgency']})")
-    print(f"")
-    cards = state["cards"]
-    if cards:
-        print(f"  剧情卡片 ({len(cards)}):")
-        for cid, info in cards.items():
-            can, reason = can_trigger_card(state, cid)
-            status = "可用" if can else reason
-            print(f"    - {cid}: 触发{info['times_triggered']}次 | {status}")
-    print(f"═══════════════════════════════════")
+    p_init = sub.add_parser("init", help="初始化会话")
+    p_init.add_argument("--session-id")
+    p_init.add_argument("--seed", help="可复现随机种子")
+    p_init.add_argument("--force", action="store_true")
+    p_init.set_defaults(func=cmd_init)
 
-def cmd_decide():
-    """输出 AI 决策所需的完整上下文（快照 + 决策矩阵提示）"""
-    state = load_state()
-    if state is None:
-        print("❌ 状态文件不存在，请先 init")
-        return
-    
-    trends = analyze_trends(state["ats_window"]) if state["ats_window"] else {}
-    latest = state["ats_window"][-1] if state["ats_window"] else {}
-    
-    snapshot = {
-        "round": state["total_rounds"],
-        "flow_state": state["flow_state"],
-        "flow_rounds": state["flow_rounds_in_state"],
-        "values": latest,
-        "trends": trends,
-        "cooldowns": state["director"],
-        "chekhov_high_urgency": [
-            i["name"] for i in state["chekhov_items"] 
-            if i["status"] == "unresolved" and i["urgency"] == "高"
-        ]
-    }
-    
-    # 输出快照 + 决策矩阵（AI 拿着这个直接按 SKILL.md 规则做判断）
-    print("=" * 50)
-    print("📊 导演状态快照")
-    print("=" * 50)
-    print(json.dumps(snapshot, ensure_ascii=False, indent=2))
-    print()
-    print("=" * 50)
-    print("🎯 决策矩阵（来自 SKILL.md P2）")
-    print("=" * 50)
-    print("""
-🟢 沉浸中 → 不干预（静默）
-🟡 趋近无聊 → 70%升压 | 30%加阻力
-🔴 趋近焦虑 → 60%降压 | 40%给突破口
-🟠 失去方向 → 50%给突破口 | 50%推动回收
-⚪ 高能后回落 → 90%日常过渡 | 10%不干预
+    p_update = sub.add_parser("update", help="从 stdin 读取 JSON/旧版 @@s 并更新一轮")
+    p_update.add_argument("legacy_action", nargs="?", help="兼容旧版位置参数：导演动作")
+    p_update.add_argument("legacy_card", nargs="?", help="兼容旧版位置参数：触发卡片")
+    p_update.add_argument("--action")
+    p_update.add_argument("--card")
+    p_update.add_argument("--expected-revision", type=int)
+    p_update.add_argument("--idempotency-key")
+    p_update.set_defaults(func=cmd_update)
 
-例外: 高紧迫度契诃夫道具未收 → 额外+40%权重选"推动回收"
-""")
+    p_decide = sub.add_parser("decide", help="输出可复现的导演决策，不修改状态")
+    p_decide.set_defaults(func=cmd_decide)
 
-def cmd_clean():
-    """删除状态文件"""
-    if STATE_FILE.exists():
-        STATE_FILE.unlink()
-        print("🗑️ 导演状态已清除")
-    else:
-        print("ℹ️ 状态文件不存在")
+    p_status = sub.add_parser("status", help="查看状态")
+    p_status.add_argument("--json", action="store_true")
+    p_status.set_defaults(func=cmd_status)
 
-# ── 主入口 ────────────────────────────────────────────
+    p_register = sub.add_parser("card-register", help="从 stdin 注册 JSON 剧情卡")
+    p_register.add_argument("--expected-revision", type=int)
+    p_register.set_defaults(func=cmd_register_cards)
 
-USAGE = """
-镜界 v2 导演状态簿记脚本
+    p_condition = sub.add_parser("card-condition", help="更新卡片条件是否满足")
+    p_condition.add_argument("card_id")
+    p_condition.add_argument("value", choices=["met", "unmet"])
+    p_condition.add_argument("--expected-revision", type=int)
+    p_condition.set_defaults(func=cmd_card_condition)
 
-用法:
-  python director_tracker.py init      - 初始化新会话
-  python director_tracker.py update    - 从 stdin 读取 @@s 并更新状态（输出快照 JSON）
-  python director_tracker.py status    - 显示当前状态摘要
-  python director_tracker.py decide    - 输出 AI 决策所需的完整上下文
-  python director_tracker.py clean     - 清除状态文件
 
-示例:
-  echo "@@s
-  scene_intensity: 7
-  chaos_proximity: 3
-  player_agency: 6
-  goal_progress: 45" | python director_tracker.py update
-"""
+    p_conditions = sub.add_parser("card-conditions", help="从 stdin 批量更新卡片条件")
+    p_conditions.add_argument("--expected-revision", type=int)
+    p_conditions.set_defaults(func=cmd_card_conditions)
+
+    p_pause = sub.add_parser("pause-set", help="不推进轮次地修改暂停状态")
+    p_pause.add_argument("level", choices=sorted(VALID_PAUSE_LEVELS))
+    p_pause.add_argument("status", choices=["RUNNING", "PAUSED"])
+    p_pause.add_argument("--reset-auto-count", action="store_true")
+    p_pause.add_argument("--expected-revision", type=int)
+    p_pause.set_defaults(func=cmd_pause_set)
+
+    p_select = sub.add_parser("card-select", help="从 stdin 接收语义分数并选择卡片")
+    p_select.set_defaults(func=cmd_card_select)
+
+    p_trigger = sub.add_parser("card-trigger", help="提交一次卡片触发")
+    p_trigger.add_argument("card_id")
+    p_trigger.add_argument("--chain-depth", type=int, default=0)
+    p_trigger.add_argument("--expected-revision", type=int)
+    p_trigger.set_defaults(func=cmd_card_trigger)
+
+    p_cp_create = sub.add_parser("checkpoint-create", help="创建完整状态快照")
+    p_cp_create.add_argument("label")
+    p_cp_create.add_argument("--kind", default="ckpt")
+    p_cp_create.add_argument("--expected-revision", type=int)
+    p_cp_create.set_defaults(func=cmd_checkpoint_create)
+
+    p_cp_list = sub.add_parser("checkpoint-list", help="列出快照")
+    p_cp_list.add_argument("--kind")
+    p_cp_list.set_defaults(func=cmd_checkpoint_list)
+
+    p_cp_preview = sub.add_parser("checkpoint-preview", help="预览快照")
+    p_cp_preview.add_argument("checkpoint_id")
+    p_cp_preview.set_defaults(func=cmd_checkpoint_preview)
+
+    p_cp_rollback = sub.add_parser("checkpoint-rollback", help="回滚并创建新分支")
+    p_cp_rollback.add_argument("checkpoint_id")
+    p_cp_rollback.add_argument("--expected-revision", type=int)
+    p_cp_rollback.set_defaults(func=cmd_checkpoint_rollback)
+
+    p_clean = sub.add_parser("clean", help="删除状态文件")
+    p_clean.add_argument("--yes", action="store_true")
+    p_clean.set_defaults(func=cmd_clean)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        args.func(args)
+        return 0
+    except (FileNotFoundError, FileExistsError, KeyError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        output_json({"ok": False, "error": str(exc), "error_type": type(exc).__name__})
+        return 2
+    except KeyboardInterrupt:
+        output_json({"ok": False, "error": "操作已中断", "error_type": "KeyboardInterrupt"})
+        return 130
+
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(USAGE)
-    else:
-        cmd = sys.argv[1]
-        if cmd == "init":
-            cmd_init()
-        elif cmd == "update":
-            cmd_update()
-        elif cmd == "status":
-            cmd_status()
-        elif cmd == "decide":
-            cmd_decide()
-        elif cmd == "clean":
-            cmd_clean()
-        else:
-            print(f"未知命令: {cmd}")
-            print(USAGE)
+    raise SystemExit(main())
