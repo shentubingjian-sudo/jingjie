@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - Unix/macOS
     msvcrt = None
 
 
-RUNTIME_VERSION = "2.7.1"
+RUNTIME_VERSION = "2.7.2"
 SCHEMA_VERSION = "2.6"
 WINDOW_SIZE = 8
 GENERAL_COOLDOWN = 2
