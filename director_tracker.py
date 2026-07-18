@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-镜界 v2.6 导演状态与剧情卡运行时
+镜界 v2.8 导演状态与剧情卡运行时
 =================================
 
 职责：
@@ -8,7 +8,8 @@
 - 以可复现随机方式选择导演动作
 - 维护剧情卡 cooldown / max_triggers / sticky / delay / chain
 - 提供原子写入、revision 并发检查、idempotency 去重
-- 创建、预览和回滚完整状态快照
+- 创建、预览和回滚完整状态快照，并维护分支谱系
+- 记录玩家命令权限与跨层 turn journal，支持外部记忆写入幂等补偿
 
 边界：
 - 本脚本不生成叙事文本
@@ -48,8 +49,8 @@ except ImportError:  # pragma: no cover - Unix/macOS
     msvcrt = None
 
 
-RUNTIME_VERSION = "2.7.2"
-SCHEMA_VERSION = "2.6"
+RUNTIME_VERSION = "2.8.0"
+SCHEMA_VERSION = "2.7"
 WINDOW_SIZE = 8
 GENERAL_COOLDOWN = 2
 CONSECUTIVE_MAX = 3
@@ -76,6 +77,9 @@ VALID_CARD_POSITIONS = {"core_rule", "world_context", "recent_focus"}
 VALID_DELAY_MODES = {"continuous", "latched"}
 VALID_CARD_SOURCES = {"author", "auto_generated", "imported"}
 VALID_CARD_TYPES = {"chekhov_gun", "encounter", "revelation", "crisis", "character_moment", "world_event"}
+VALID_CARD_ROLES = {"setup", "reminder", "payoff", "standalone"}
+VALID_PLAYER_COMMAND_MODES = {"PLAYER_ACTION", "AUTHOR_DIRECTIVE"}
+TURN_JOURNAL_LIMIT = 100
 
 ACTION_WEIGHTS: dict[str, list[tuple[Optional[str], float]]] = {
     "沉浸中": [(None, 1.0)],
@@ -120,6 +124,12 @@ def init_state(session_id: Optional[str] = None, seed: Optional[str] = None) -> 
             "status": "RUNNING",
             "auto_advance_count": 0,
             "cooldown_threshold": 3,
+            "auto_advance_timeout_seconds": 600,
+        },
+        "control": {
+            "player_narrative_authority": "highest_in_world",
+            "author_directive_enabled": True,
+            "last_player_command": None,
         },
         "director": {
             "last_action": None,
@@ -141,15 +151,24 @@ def init_state(session_id: Optional[str] = None, seed: Optional[str] = None) -> 
             "parent_branch_id": None,
             "abandoned_branches": [],
             "metaknowledge_holders": [],
+            "branches": {
+                "branch_main": {
+                    "parent_id": None,
+                    "fork_round": 0,
+                    "created_at": now_iso(),
+                    "status": "active",
+                }
+            },
         },
         "checkpoints": [],
         "event_log": [],
         "idempotency_keys": [],
+        "turn_journal": [],
     }
 
 
 def migrate_state(raw: dict[str, Any]) -> dict[str, Any]:
-    """将 v2.0/v2.5 状态迁移到 v2.6，尽量保留已有数据。"""
+    """将旧状态迁移到当前 Schema，尽量保留已有数据。"""
     if raw.get("schema_version") == SCHEMA_VERSION:
         state = raw
     else:
@@ -182,25 +201,41 @@ def migrate_state(raw: dict[str, Any]) -> dict[str, Any]:
                 # 迁移模式：宽松校验，非法枚举用默认值
                 state["cards"][card_id] = normalize_card_spec(spec, strict=False)
 
-        for key in ("pause", "timeline"):
+        for key in ("pause", "control", "timeline"):
             if isinstance(raw.get(key), dict):
                 state[key].update(raw[key])
         state["checkpoints"] = list(raw.get("checkpoints", []))
         state["event_log"] = list(raw.get("event_log", []))[-EVENT_LOG_LIMIT:]
         state["idempotency_keys"] = list(raw.get("idempotency_keys", []))[-IDEMPOTENCY_LIMIT:]
+        state["turn_journal"] = list(raw.get("turn_journal", []))[-TURN_JOURNAL_LIMIT:]
 
     # 补齐未来版本新增键，避免半迁移状态崩溃
     defaults = init_state(state.get("session_id"), state.get("seed"))
     for key, value in defaults.items():
         state.setdefault(key, copy.deepcopy(value))
-    for nested in ("pause", "director", "timeline"):
+    for nested in ("pause", "director", "control", "timeline"):
         for key, value in defaults[nested].items():
             state[nested].setdefault(key, copy.deepcopy(value))
+    current_branch = str(state["timeline"].get("current_branch_id") or "branch_main")
+    branches = state["timeline"].get("branches")
+    if not isinstance(branches, dict):
+        branches = {}
+    branches.setdefault(
+        current_branch,
+        {
+            "parent_id": state["timeline"].get("parent_branch_id"),
+            "fork_round": 0,
+            "created_at": state.get("started_at", now_iso()),
+            "status": "active",
+        },
+    )
+    state["timeline"]["branches"] = branches
     state["schema_version"] = SCHEMA_VERSION
     state["revision"] = int(state.get("revision", 0))
     state["ats_window"] = list(state.get("ats_window", []))[-WINDOW_SIZE:]
     state["event_log"] = list(state.get("event_log", []))[-EVENT_LOG_LIMIT:]
     state["idempotency_keys"] = list(state.get("idempotency_keys", []))[-IDEMPOTENCY_LIMIT:]
+    state["turn_journal"] = list(state.get("turn_journal", []))[-TURN_JOURNAL_LIMIT:]
     return state
 
 
@@ -332,7 +367,7 @@ def parse_legacy_yaml(text: str) -> dict[str, Any]:
     return result
 
 
-def parse_patch(text: str) -> dict[str, Any]:
+def parse_payload(text: str) -> dict[str, Any]:
     text = text.strip()
     if not text:
         raise ValueError("未收到状态补丁")
@@ -349,9 +384,62 @@ def parse_patch(text: str) -> dict[str, Any]:
             data = yaml.safe_load(text)
     if not isinstance(data, dict):
         raise ValueError("状态补丁顶层必须是 object")
-    if isinstance(data.get("state_patch"), dict):
-        data = data["state_patch"]
     return data
+
+
+def parse_patch(text: str) -> dict[str, Any]:
+    """兼容旧调用：只返回 state_patch。"""
+    data = parse_payload(text)
+    if isinstance(data.get("state_patch"), dict):
+        return data["state_patch"]
+    return data
+
+
+def normalize_player_command(value: Any) -> dict[str, Any]:
+    """规范化玩家命令。AUTHOR_DIRECTIVE 是世界内最高权限，但不能覆盖宿主硬规则。"""
+    if value is None:
+        return {"mode": "PLAYER_ACTION", "summary": "", "override_pause": False}
+    if isinstance(value, str):
+        value = {"mode": "PLAYER_ACTION", "summary": value}
+    if not isinstance(value, dict):
+        raise ValueError("player_command 必须是 object 或 string")
+    mode = str(value.get("mode") or "PLAYER_ACTION")
+    if mode not in VALID_PLAYER_COMMAND_MODES:
+        raise ValueError(f"player_command.mode 非法：{mode!r}；允许值：{sorted(VALID_PLAYER_COMMAND_MODES)}")
+    summary = str(value.get("summary") or value.get("content") or "").strip()
+    if len(summary) > 1000:
+        summary = summary[:1000]
+    override_pause = value.get("override_pause", False)
+    if not isinstance(override_pause, bool):
+        raise ValueError("player_command.override_pause 必须为 JSON boolean")
+    return {"mode": mode, "summary": summary, "override_pause": override_pause}
+
+
+def split_turn_payload(data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """拆分本轮主状态补丁与可幂等补写的外部层操作。"""
+    if isinstance(data.get("state_patch"), dict):
+        patch = data["state_patch"]
+        envelope = data
+    else:
+        patch = data
+        envelope = {}
+
+    operations: dict[str, Any] = {}
+    for key in (
+        "memory_operations",
+        "portrait_operations",
+        "summary_operation",
+        "plot_operations",
+        "card_operations",
+    ):
+        if key in envelope and envelope[key] not in (None, [], {}):
+            operations[key] = envelope[key]
+
+    return patch, {
+        "turn_id": str(envelope.get("turn_id") or "").strip(),
+        "player_command": normalize_player_command(envelope.get("player_command")),
+        "operations": operations,
+    }
 
 
 def clamp_number(value: Any, low: int, high: int, default: int) -> int:
@@ -372,7 +460,6 @@ def normalize_metrics(patch: dict[str, Any]) -> dict[str, Any]:
         "npc_attitude_shifts": patch.get("npc_attitude_shifts", []),
         "pending_flags": patch.get("pending_flags", []),
         "npc_reflections": patch.get("npc_reflections", []),
-        "branch_id": patch.get("branch_id"),
     }
 
 
@@ -622,12 +709,14 @@ def normalize_card_spec(spec: dict[str, Any], strict: bool = True) -> dict[str, 
     position = _require_enum("inject_position", spec.get("inject_position"), VALID_CARD_POSITIONS, "recent_focus", strict)
     delay_mode = _require_enum("delay_mode", spec.get("delay_mode"), VALID_DELAY_MODES, "latched", strict)
     card_type = _require_enum("type", spec.get("type"), VALID_CARD_TYPES, "world_event", strict)
+    card_role = _require_enum("role", spec.get("role"), VALID_CARD_ROLES, "standalone", strict)
     # P1-3.2: 保留 source 字段
     source = _require_enum("source", spec.get("source"), VALID_CARD_SOURCES, "author", strict)
 
     return {
         "id": card_id,
         "type": card_type,
+        "role": card_role,
         "source": source,  # P1-3.2: 保留来源标记
         "trigger_hint": spec.get("trigger_hint", ""),
         "director_action": spec.get("director_action", "任意"),
@@ -912,7 +1001,7 @@ def update_pause(state: dict[str, Any], patch: dict[str, Any]) -> None:
             f"合法组合：L1/L2/L4 必须 PAUSED，L3 必须 RUNNING"
         )
 
-    for key in ("auto_advance_count", "cooldown_threshold"):
+    for key in ("auto_advance_count", "cooldown_threshold", "auto_advance_timeout_seconds"):
         if key in pause_patch:
             state["pause"][key] = max(0, int(pause_patch[key]))
 
@@ -950,6 +1039,51 @@ def find_checkpoint(state: dict[str, Any], checkpoint_id: str) -> dict[str, Any]
     raise KeyError(f"找不到回滚点：{checkpoint_id}")
 
 
+def branch_visibility_limits(state: dict[str, Any], branch_id: Optional[str] = None) -> dict[str, Optional[int]]:
+    """返回当前分支及祖先分支的可见轮次上限；None 表示当前分支无限制。"""
+    timeline = state.get("timeline", {})
+    branches = timeline.get("branches", {})
+    current = str(branch_id or timeline.get("current_branch_id") or "branch_main")
+    limits: dict[str, Optional[int]] = {current: None}
+    seen: set[str] = set()
+    child = current
+    inherited_limit: Optional[int] = None
+
+    while child and child not in seen:
+        seen.add(child)
+        node = branches.get(child)
+        if not isinstance(node, dict):
+            break
+        parent = node.get("parent_id")
+        if not parent:
+            break
+        fork_round = max(0, int(node.get("fork_round", 0)))
+        inherited_limit = fork_round if inherited_limit is None else min(inherited_limit, fork_round)
+        parent_id = str(parent)
+        limits[parent_id] = inherited_limit
+        child = parent_id
+    return limits
+
+
+def memory_visible_from_branch(
+    state: dict[str, Any],
+    origin_branch_id: str,
+    origin_round: int,
+    holder: Optional[str] = None,
+) -> tuple[bool, str]:
+    """判断一条分支记忆对当前分支是否可见。"""
+    meta_holders = set(state.get("timeline", {}).get("metaknowledge_holders", []))
+    if holder and holder in meta_holders:
+        return True, "角色拥有跨分支元知识"
+    limits = branch_visibility_limits(state)
+    if origin_branch_id not in limits:
+        return False, "来源分支不在当前分支祖先链"
+    limit = limits[origin_branch_id]
+    if limit is None or int(origin_round) <= int(limit):
+        return True, "当前分支或分叉点之前的祖先记忆"
+    return False, f"记忆发生于祖先分支分叉点之后（可见上限 round {limit}）"
+
+
 def rollback_checkpoint(state: dict[str, Any], checkpoint_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     target = find_checkpoint(state, checkpoint_id)
     checkpoints = copy.deepcopy(state["checkpoints"])
@@ -959,6 +1093,10 @@ def rollback_checkpoint(state: dict[str, Any], checkpoint_id: str) -> tuple[dict
     seed = state["seed"]
     current_revision = state["revision"]
     old_branch = state["timeline"]["current_branch_id"]
+    branch_registry = copy.deepcopy(state["timeline"].get("branches", {}))
+    prior_abandoned = copy.deepcopy(state["timeline"].get("abandoned_branches", []))
+    meta_holders = copy.deepcopy(state["timeline"].get("metaknowledge_holders", []))
+    turn_journal = copy.deepcopy(state.get("turn_journal", []))
 
     safety = create_checkpoint(state, f"回滚前安全备份：{checkpoint_id}", "rollback_safety")
     checkpoints = copy.deepcopy(state["checkpoints"])
@@ -971,9 +1109,19 @@ def rollback_checkpoint(state: dict[str, Any], checkpoint_id: str) -> tuple[dict
     restored["event_log"] = event_log
     restored["idempotency_keys"] = idempotency
 
-    target_branch = target.get("branch_id")
+    target_branch = str(target.get("branch_id") or "branch_main")
+    target_round = int(target.get("round", 0))
+    for entry in turn_journal:
+        if (
+            entry.get("branch_id") == old_branch
+            and int(entry.get("round", 0)) > target_round
+            and entry.get("external_status") == "pending"
+        ):
+            entry["external_status"] = "cancelled_by_rollback"
+            entry["acked_at"] = now_iso()
+    restored["turn_journal"] = turn_journal[-TURN_JOURNAL_LIMIT:]
     new_branch = _new_branch_id()
-    abandoned = list(restored["timeline"].get("abandoned_branches", []))
+    abandoned = prior_abandoned
     abandoned.append(
         {
             "branch_id": old_branch,
@@ -981,9 +1129,34 @@ def rollback_checkpoint(state: dict[str, Any], checkpoint_id: str) -> tuple[dict
             "rollback_target": checkpoint_id,
         }
     )
+    if old_branch not in branch_registry:
+        branch_registry[old_branch] = {
+            "parent_id": state["timeline"].get("parent_branch_id"),
+            "fork_round": 0,
+            "created_at": state.get("started_at", now_iso()),
+            "status": "abandoned",
+        }
+    else:
+        branch_registry[old_branch]["status"] = "abandoned"
+    if target_branch not in branch_registry:
+        branch_registry[target_branch] = {
+            "parent_id": None,
+            "fork_round": 0,
+            "created_at": target.get("created_at", now_iso()),
+            "status": "historical",
+        }
+    branch_registry[new_branch] = {
+        "parent_id": target_branch,
+        "fork_round": target_round,
+        "created_at": now_iso(),
+        "status": "active",
+        "rollback_target": checkpoint_id,
+    }
     restored["timeline"]["parent_branch_id"] = target_branch
     restored["timeline"]["current_branch_id"] = new_branch
     restored["timeline"]["abandoned_branches"] = abandoned[-50:]
+    restored["timeline"]["metaknowledge_holders"] = meta_holders
+    restored["timeline"]["branches"] = branch_registry
     return restored, safety
 
 
@@ -1006,6 +1179,54 @@ def remember_idempotency(state: dict[str, Any], key: Optional[str]) -> None:
     state["idempotency_keys"] = state["idempotency_keys"][-IDEMPOTENCY_LIMIT:]
 
 
+def record_turn_journal(
+    state: dict[str, Any],
+    turn_id: str,
+    player_command: dict[str, Any],
+    operations: dict[str, Any],
+) -> None:
+    """记录跨层操作，使记忆/画像/摘要层可按 turn_id 幂等补写。"""
+    if not turn_id:
+        if operations:
+            raise ValueError("包含外部层操作时必须提供 turn_id")
+        return
+    if any(entry.get("turn_id") == turn_id for entry in state["turn_journal"]):
+        return
+    state["turn_journal"].append(
+        {
+            "turn_id": turn_id,
+            "round": state["total_rounds"],
+            "branch_id": state["timeline"]["current_branch_id"],
+            "committed_revision": int(state["revision"]) + 1,
+            "player_command": copy.deepcopy(player_command),
+            "external_operations": copy.deepcopy(operations),
+            "external_status": "pending" if operations else "not_required",
+            "created_at": now_iso(),
+            "acked_at": None,
+        }
+    )
+    state["turn_journal"] = state["turn_journal"][-TURN_JOURNAL_LIMIT:]
+
+
+def pending_turn_operations(state: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        copy.deepcopy(entry)
+        for entry in state.get("turn_journal", [])
+        if entry.get("external_status") == "pending"
+    ]
+
+
+def acknowledge_turn_operations(state: dict[str, Any], turn_id: str) -> dict[str, Any]:
+    for entry in state.get("turn_journal", []):
+        if entry.get("turn_id") == turn_id:
+            if entry.get("external_status") == "not_required":
+                return entry
+            entry["external_status"] = "applied"
+            entry["acked_at"] = now_iso()
+            return entry
+    raise KeyError(f"找不到 turn journal：{turn_id}")
+
+
 def _is_resume_patch(patch: dict[str, Any]) -> bool:
     """判断补丁是否是恢复操作（从 L1/L2/L4 恢复到 L3/RUNNING）"""
     pause_patch = patch.get("pause")
@@ -1017,13 +1238,22 @@ def _is_resume_patch(patch: dict[str, Any]) -> bool:
     )
 
 
-def assert_round_can_advance(state: dict[str, Any], patch: dict[str, Any]) -> None:
-    """P0-2.2: 暂停门禁 — L1/L2/L4 暂停时禁止推进剧情，除非是恢复操作"""
+def assert_round_can_advance(
+    state: dict[str, Any],
+    patch: dict[str, Any],
+    player_command: Optional[dict[str, Any]] = None,
+) -> None:
+    """暂停门禁；明确的作者级命令可按玩家要求越过暂停。"""
     pause = state.get("pause", {})
     level = pause.get("level", "L3")
     status = pause.get("status", "RUNNING")
     blocked = status == "PAUSED" or level in {"L1", "L2", "L4"}
-    if blocked and not _is_resume_patch(patch):
+    command = player_command or {}
+    author_override = (
+        command.get("mode") == "AUTHOR_DIRECTIVE"
+        and command.get("override_pause") is True
+    )
+    if blocked and not _is_resume_patch(patch) and not author_override:
         raise RuntimeError(
             f"当前处于 {level}/{status} 暂停状态，禁止推进剧情轮次。"
             f"如需恢复，请在补丁中包含 pause.level=L3, pause.status=RUNNING"
@@ -1035,9 +1265,16 @@ def apply_update(
     patch: dict[str, Any],
     last_action: Optional[str] = None,
     triggered_card: Optional[str] = None,
+    player_command: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    # P0-2.2: 暂停门禁 — 在任何状态变更之前检查
-    assert_round_can_advance(state, patch)
+    protected = {"branch_id", "timeline", "revision", "session_id", "seed"}
+    illegal = sorted(protected.intersection(patch))
+    if illegal:
+        raise ValueError(f"状态补丁不得直接修改受保护字段：{', '.join(illegal)}")
+
+    command = player_command or normalize_player_command(None)
+    # 暂停门禁 — 在任何状态变更之前检查
+    assert_round_can_advance(state, patch, command)
 
     tick_cooldowns(state)
     tick_chekhov_items(state)
@@ -1050,12 +1287,17 @@ def apply_update(
     prune_card_runtime(state)
 
     metrics = normalize_metrics(patch)
-    if metrics.get("branch_id") and metrics["branch_id"] != state["timeline"]["current_branch_id"]:
-        raise ValueError("状态补丁 branch_id 与当前分支不一致")
     state["ats_window"].append(metrics)
     state["ats_window"] = state["ats_window"][-WINDOW_SIZE:]
 
     update_pause(state, patch)
+    state["control"]["last_player_command"] = {
+        "mode": command["mode"],
+        "summary": command["summary"],
+        "override_pause": command["override_pause"],
+        "round": state["total_rounds"],
+        "branch_id": state["timeline"]["current_branch_id"],
+    }
 
     additions = patch.get("chekhov_add", patch.get("unresolved_chekhov", []))
     if isinstance(additions, (str, dict)):
@@ -1124,6 +1366,8 @@ def build_snapshot(state: dict[str, Any], metrics: Optional[dict[str, Any]] = No
         "session_id": state["session_id"],
         "round": state["total_rounds"],
         "branch_id": state["timeline"]["current_branch_id"],
+        "branch_lineage": branch_visibility_limits(state),
+        "player_control": copy.deepcopy(state.get("control", {})),
         "flow_state": state["flow_state"],
         "flow_rounds_in_state": state["flow_rounds_in_state"],
         "current_values": {
@@ -1150,6 +1394,9 @@ def build_snapshot(state: dict[str, Any], metrics: Optional[dict[str, Any]] = No
         "high_urgency_chekhov": [item for item in unresolved if item.get("urgency") == "高"],
         "cards_summary": {
             card_id: {
+                "type": card["type"],
+                "role": card.get("role", "standalone"),
+                "source": card.get("source", "author"),
                 "times_triggered": card["times_triggered"],
                 "can_trigger": can_trigger_card(state, card_id)[0],
                 "can_trigger_reason": can_trigger_card(state, card_id)[1],
@@ -1160,6 +1407,7 @@ def build_snapshot(state: dict[str, Any], metrics: Optional[dict[str, Any]] = No
         "sticky_active": sticky,
         "delay_waiting": delay,
         "chain_queue": copy.deepcopy(state["chain_queue"]),
+        "pending_external_turns": [entry["turn_id"] for entry in pending_turn_operations(state)],
     }
 
 
@@ -1183,7 +1431,15 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 def cmd_update(args: argparse.Namespace) -> None:
     text = read_stdin_json_or_text()
-    patch = parse_patch(text)
+    payload = parse_payload(text)
+    patch, turn_meta = split_turn_payload(payload)
+    turn_id = turn_meta["turn_id"] or (args.idempotency_key or "")
+    player_command = turn_meta["player_command"]
+    operations = turn_meta["operations"]
+    if turn_id and args.idempotency_key and turn_id != args.idempotency_key:
+        raise ValueError("turn_id 必须与 --idempotency-key 一致")
+    if operations and not turn_id:
+        raise ValueError("包含 memory/portrait/summary/plot/card operations 时必须提供 turn_id 或 --idempotency-key")
     last_action = args.action or args.legacy_action
     triggered_card = args.card or args.legacy_card
     if isinstance(last_action, str) and last_action.lower() in {"none", "null", "静默", "不干预"}:
@@ -1193,17 +1449,26 @@ def cmd_update(args: argparse.Namespace) -> None:
     with state_lock(args.state_file):
         state = load_state(args.state_file, required=True)
         assert state is not None
-        validate_revision(state, args.expected_revision)
-        if check_idempotency(state, args.idempotency_key):
+        commit_key = args.idempotency_key or turn_id
+        if check_idempotency(state, commit_key):
             output_json({"ok": True, "duplicate": True, "revision": state["revision"], "snapshot": build_snapshot(state)})
             return
-        snapshot = apply_update(state, patch, last_action, triggered_card)
-        remember_idempotency(state, args.idempotency_key)
+        validate_revision(state, args.expected_revision)
+        snapshot = apply_update(state, patch, last_action, triggered_card, player_command)
+        record_turn_journal(state, turn_id, player_command, operations)
+        remember_idempotency(state, commit_key)
         commit_state(
             args.state_file,
             state,
             "round_update",
-            {"action": last_action, "triggered_card": triggered_card, "idempotency_key": args.idempotency_key},
+            {
+                "action": last_action,
+                "triggered_card": triggered_card,
+                "idempotency_key": commit_key,
+                "turn_id": turn_id or None,
+                "player_command_mode": player_command["mode"],
+                "external_operations_pending": bool(operations),
+            },
         )
         snapshot["revision"] = state["revision"]
     output_json({"ok": True, "duplicate": False, "snapshot": snapshot})
@@ -1230,9 +1495,12 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"  心流: {snap['flow_state']} ({snap['flow_rounds_in_state']}轮)")
     print(f"  激烈 {values['scene_intensity']} | 失控 {values['chaos_proximity']} | 掌控 {values['player_agency']} | 目标 {values['goal_progress']}%")
     print(f"  暂停: {snap['pause']['level']} / {snap['pause']['status']}")
+    last_command = snap["player_control"].get("last_player_command") or {}
+    print(f"  玩家权限: 世界内最高 | 上次命令: {last_command.get('mode', '无')}")
     print(f"  上次动作: {snap['director_cooldowns']['last_action'] or '无'}")
     print(f"  通用冷却: {snap['director_cooldowns']['general_cooldown']} | 强制静默: {snap['director_cooldowns']['silence_required']}")
     print(f"  未回收伏笔: {len(snap['chekhov_items'])} | 卡片: {len(snap['cards_summary'])}")
+    print(f"  待补写外部操作: {len(snap['pending_external_turns'])}")
     print("═" * 46)
 
 
@@ -1286,8 +1554,7 @@ def cmd_pause_set(args: argparse.Namespace) -> None:
         state = load_state(args.state_file, required=True)
         assert state is not None
         validate_revision(state, args.expected_revision)
-        state["pause"]["level"] = args.level
-        state["pause"]["status"] = args.status
+        update_pause(state, {"pause": {"level": args.level, "status": args.status}})
         if args.reset_auto_count:
             state["pause"]["auto_advance_count"] = 0
         commit_state(
@@ -1383,6 +1650,49 @@ def cmd_checkpoint_rollback(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_branch_visible(args: argparse.Namespace) -> None:
+    state = load_state(args.state_file, required=True)
+    assert state is not None
+    visible, reason = memory_visible_from_branch(
+        state,
+        args.memory_branch,
+        args.memory_round,
+        args.holder,
+    )
+    output_json(
+        {
+            "ok": True,
+            "visible": visible,
+            "reason": reason,
+            "current_branch": state["timeline"]["current_branch_id"],
+            "lineage_limits": branch_visibility_limits(state),
+        }
+    )
+
+
+def cmd_turn_pending(args: argparse.Namespace) -> None:
+    state = load_state(args.state_file, required=True)
+    assert state is not None
+    output_json({"ok": True, "revision": state["revision"], "pending": pending_turn_operations(state)})
+
+
+def cmd_turn_ack(args: argparse.Namespace) -> None:
+    with state_lock(args.state_file):
+        state = load_state(args.state_file, required=True)
+        assert state is not None
+        validate_revision(state, args.expected_revision)
+        entry = acknowledge_turn_operations(state, args.turn_id)
+        commit_state(args.state_file, state, "turn_operations_acked", {"turn_id": args.turn_id})
+    output_json(
+        {
+            "ok": True,
+            "revision": state["revision"],
+            "turn_id": args.turn_id,
+            "external_status": entry["external_status"],
+        }
+    )
+
+
 def cmd_clean(args: argparse.Namespace) -> None:
     if not args.yes:
         raise ValueError("clean 是破坏性操作，请加 --yes")
@@ -1393,7 +1703,7 @@ def cmd_clean(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="镜界 v2.6 导演状态运行时")
+    parser = argparse.ArgumentParser(description="镜界 v2.8 导演状态运行时")
     parser.add_argument(
         "--state-file",
         type=lambda value: Path(value).expanduser().resolve(),
@@ -1473,6 +1783,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_cp_rollback.add_argument("checkpoint_id")
     p_cp_rollback.add_argument("--expected-revision", type=int)
     p_cp_rollback.set_defaults(func=cmd_checkpoint_rollback)
+
+    p_branch_visible = sub.add_parser("branch-visible", help="判断分支记忆对当前分支是否可见")
+    p_branch_visible.add_argument("memory_branch")
+    p_branch_visible.add_argument("memory_round", type=int)
+    p_branch_visible.add_argument("--holder")
+    p_branch_visible.set_defaults(func=cmd_branch_visible)
+
+    p_turn_pending = sub.add_parser("turn-pending", help="列出尚未应用的外部记忆/画像/摘要操作")
+    p_turn_pending.set_defaults(func=cmd_turn_pending)
+
+    p_turn_ack = sub.add_parser("turn-ack", help="确认某轮外部层操作已幂等应用")
+    p_turn_ack.add_argument("turn_id")
+    p_turn_ack.add_argument("--expected-revision", type=int)
+    p_turn_ack.set_defaults(func=cmd_turn_ack)
 
     p_clean = sub.add_parser("clean", help="删除状态文件")
     p_clean.add_argument("--yes", action="store_true")
